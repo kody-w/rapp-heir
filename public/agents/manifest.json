@@ -1,0 +1,28 @@
+{
+  "format": "rapp-basic-agents",
+  "version": 1,
+  "execution": "reference-source-only",
+  "notice": "The browser never executes peer-supplied code. Its typed TypeScript reducer mirrors bounded behavior.",
+  "agents": [
+    {
+      "name": "QuestMaster",
+      "path": "quest_master_agent.py",
+      "sha256": "5a155774b590d2127fda09b563fb04611b525082829b1da6c1ad7a0e28fd1e5d"
+    },
+    {
+      "name": "QuestTurn",
+      "path": "quest_turn_agent.py",
+      "sha256": "1d65187f700bf72bc133b4bb697544dbf79bcdaad12c31a6a181729cf6142a6d"
+    },
+    {
+      "name": "PartyMemory",
+      "path": "party_memory_agent.py",
+      "sha256": "fcf9c3495a308d12bbae0ab2e96c7eac3d6563c362124bd02905e9310f4b03df"
+    },
+    {
+      "name": "QuestSafety",
+      "path": "quest_safety_agent.py",
+      "sha256": "0310826a85b5ff9ba0d3e5cbee76f42997ec2667dd824e6a975ba83a6abefb17"
+    }
+  ]
+}

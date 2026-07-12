@@ -1,0 +1,26 @@
+{
+  "id": "/rapp-heir/",
+  "name": "Rapp Heir",
+  "short_name": "Rapp Heir",
+  "description": "A local-first Pocket Quest Master for an evolving Circle organism.",
+  "start_url": "/rapp-heir/",
+  "scope": "/rapp-heir/",
+  "display": "standalone",
+  "background_color": "#151329",
+  "theme_color": "#151329",
+  "categories": ["games", "lifestyle"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

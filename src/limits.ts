@@ -1,0 +1,5 @@
+export const MAX_REPLICA_EVENTS = 256;
+export const MAX_REPLICA_BYTES = 512 * 1024;
+export const MAX_SECURE_PLAINTEXT_BYTES = 560 * 1024;
+export const MAX_WIRE_MESSAGE_BYTES = 768 * 1024;
+export const MAX_SPECIALIZATION_LENGTH = 120;
