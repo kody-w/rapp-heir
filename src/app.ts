@@ -1,10 +1,38 @@
 import QRCode from "qrcode";
+import {
+  adaptiveOrbReducer,
+  createAdaptiveOrbState,
+  highlightedPetal,
+  shouldIgnoreOrbShortcut,
+  withOrbContext,
+  type AdaptiveOrbState,
+  type OrbActionId,
+  type OrbActivation,
+} from "./adaptive-orb";
 import { canonicalStringify, boundedJsonParse } from "./canonical";
 import { createOfflineDemo, appendDemoEvent, finalizeCircle, getDemoIdentity } from "./circle";
-import { parseCommand, VoicePocketGM, type PocketCommand } from "./commands";
+import { parseOrbInput, VoicePocketGM, type PocketCommand } from "./commands";
 import { decryptHeirpack, encryptHeirpack, generateIdentity } from "./crypto";
 import { heirloomEligibility, importVerifiedHeirloom, mintHeirloom, verifyHeirloom } from "./heirloom";
+import {
+  AiVoicePlaybackGate,
+  approveRemoteContext,
+  buildRemoteContextPreview,
+  IntelligenceService,
+  REMOTE_RECIPIENT_CHAIN,
+  safeLocalLegForProjection,
+  type DeviceCodeView,
+  type RemoteContextPreview,
+} from "./intelligence";
 import { OrganismRenderer, deriveOrganismState } from "./organism";
+import {
+  PendingProposalGate,
+  stagePendingProposal,
+  stateDigestForProposal,
+  type PendingProposal,
+  type ProposalBinding,
+  type ProposalOrigin,
+} from "./pending-proposal";
 import { CircleLinkController } from "./peer";
 import { decodeInvite, encodeInviteCode, inviteLink, type BootstrapInvite, type OfferMode } from "./protocol";
 import {
@@ -13,7 +41,7 @@ import {
   deriveSharedReveal,
   latestQuest,
   offeringPayload,
-  optionallyEnhancePrompt,
+  QUEST_ROLES,
   questPayload,
   sanitizeOffering,
 } from "./quest";
@@ -91,13 +119,41 @@ function currentForm(event: Event): HTMLFormElement {
   return event.currentTarget;
 }
 
+type OrbUserSource = "typed" | "voice" | "touch" | "keyboard";
+
 export class RappHeirApp {
   readonly #root: HTMLElement;
   #database: ReplicaDatabase | undefined;
   #identity: LocalIdentity | undefined;
   #status = "Local shell ready.";
+  #alert = "";
   #voiceOutput = "";
   #voice: VoicePocketGM;
+  #orbState: AdaptiveOrbState = createAdaptiveOrbState();
+  #proposalGate = new PendingProposalGate();
+  #userTurn = 0;
+  #intelligence = new IntelligenceService();
+  #deviceCode: DeviceCodeView | undefined;
+  #loginUiGeneration = 0;
+  #aiPreview: RemoteContextPreview | undefined;
+  #aiDraft = "";
+  #aiVoice = "";
+  #aiStreaming = false;
+  #aiUiGeneration = 0;
+  #aiVoicePlayback = new AiVoicePlaybackGate();
+  #cameraAssist:
+    | {
+        enabled: boolean;
+        enable(
+          video: HTMLVideoElement,
+          onHighlight: (highlight: {
+            direction: "left" | "right" | "up" | "down" | "center";
+            armed: boolean;
+          }) => void,
+        ): Promise<{ enabled: boolean; reason?: "unsupported" | "unavailable" }>;
+        disable(): void;
+      }
+    | undefined;
   #scanner = new InviteScanner();
   #link: CircleLinkController | undefined;
   #invite: BootstrapInvite | undefined;
@@ -117,7 +173,7 @@ export class RappHeirApp {
   constructor(root: HTMLElement) {
     this.#root = root;
     this.#voice = new VoicePocketGM(
-      (transcript) => void this.#runPocketCommand(transcript),
+      (transcript) => void this.#handleOrbInput(transcript, "voice"),
       (status) => this.#setStatus(status),
     );
   }
@@ -152,6 +208,13 @@ export class RappHeirApp {
     if (region) region.textContent = message;
   }
 
+  #setAlert(message: string): void {
+    this.#alert = message;
+    const region = document.querySelector<HTMLElement>("#alert-status");
+    if (region) region.textContent = message;
+    this.#setStatus(message);
+  }
+
   #clearLinkState(): void {
     this.#link?.dispose();
     this.#link = undefined;
@@ -163,9 +226,21 @@ export class RappHeirApp {
 
   #disposeRouteState(): void {
     this.#scanner.stop();
-    this.#voice.stopListening();
+    this.#voice.stopAll();
     this.#talkCleanup?.();
     this.#talkCleanup = undefined;
+    this.#cameraAssist?.disable();
+    this.#intelligence.cancelDeviceLogin();
+    this.#intelligence.abortChat();
+    this.#loginUiGeneration += 1;
+    this.#aiUiGeneration += 1;
+    this.#deviceCode = undefined;
+    this.#aiPreview = undefined;
+    this.#aiDraft = "";
+    this.#aiVoice = "";
+    this.#aiStreaming = false;
+    this.#proposalGate.cancel();
+    this.#orbState = createAdaptiveOrbState({ signedIn: this.#intelligence.authenticated });
     this.#clearLinkState();
     if (this.#lastRoutePath.startsWith("/reunion/")) {
       this.#reunionChallenge = undefined;
@@ -184,6 +259,7 @@ export class RappHeirApp {
     const previousFocusId = routeChanged ? "" : (document.activeElement as HTMLElement | null)?.id ?? "";
     this.#talkCleanup?.();
     this.#talkCleanup = undefined;
+    this.#cameraAssist?.disable();
     this.#organismRenderer?.destroy();
     this.#organismRenderer = undefined;
     let content = "";
@@ -210,6 +286,7 @@ export class RappHeirApp {
       content = `<section class="card"><h1 tabindex="-1">Path not found</h1><a class="button" href="#/circles">Return to Circles</a></section>`;
     }
     if (renderNumber !== this.#renderNumber) return;
+    const alert = this.#alert;
     this.#root.innerHTML = `
       <header class="app-header">
         <a class="brand" href="${this.#identity ? "#/circles" : "#/welcome"}" aria-label="Rapp Heir home">
@@ -225,8 +302,10 @@ export class RappHeirApp {
       </header>
       <main id="main" tabindex="-1">${content}</main>
       <div id="live-status" class="live-status" role="status" aria-live="polite">${escapeHtml(this.#status)}</div>
+      <div id="alert-status" class="sr-only" role="alert" aria-live="assertive">${escapeHtml(alert)}</div>
       <footer><p>Local-first • no ambient microphone • PeerJS IDs are transport addresses, not identity</p></footer>
     `;
+    this.#alert = "";
     this.#bind(route);
     this.#lastRoutePath = route.path;
     if (routeChanged) {
@@ -506,83 +585,255 @@ export class RappHeirApp {
         )
       : [];
     const ownOffering = offerings.find((event) => event.body.memberId === this.#identityRequired().memberId);
+    const organism = group.genesis ? await deriveOrganismState(group, events) : undefined;
+    this.#orbState = withOrbContext(this.#orbState, {
+      questActive: Boolean(quest),
+      signedIn: this.#intelligence.authenticated,
+    });
+    const selected = highlightedPetal(this.#orbState);
+    const pending = this.#proposalGate.pending;
+    const tunnel = this.#orbState.breadcrumb.at(-1);
     let leg = "";
     if (quest) {
       const derived = await deriveQuestLeg(quest, this.#identityRequired().memberId, offerings);
       leg = `<article class="quest-leg">
-        <p class="eyebrow">${escapeHtml(derived.role)} • ${derived.minutes} minutes • mark ${escapeHtml(
-          derived.influenceMark,
-        )}</p>
+        <p class="eyebrow">Offline deterministic template • ${escapeHtml(derived.role)} • ${derived.minutes} minutes</p>
         <h2>${escapeHtml(quest.title)}</h2><p>${escapeHtml(quest.premise)}</p>
         <p class="prompt">${escapeHtml(derived.prompt)}</p>
-        <p class="fine">${
+        <p class="fine">Local mark ${escapeHtml(derived.influenceMark)}. ${
           derived.influencedBy.length
-            ? `Materially changed by ${derived.influencedBy.length} prior offering(s).`
-            : "Leave the first choice in this stretch of the Braid."
+            ? `Materially changed by ${derived.influencedBy.length} signed prior offering(s).`
+            : "No remote model is needed; leave the first choice in this stretch of the Braid."
         }</p>
       </article>`;
     }
-    return `
-      <section class="route" aria-labelledby="gm-title">
-        <p class="eyebrow">Voice-first • typed/tap parity</p>
-        <h1 id="gm-title" tabindex="-1">Pocket Quest Master</h1>
-        <p>No ambient listening. Speech recognition runs only while pressed, requests local processing where supported,
-        and stores only the final text you choose to submit—never raw audio.</p>
-        <section class="gm-console">
-          <button id="push-to-talk" class="talk-button" aria-describedby="talk-help" aria-pressed="false">
-            <span aria-hidden="true">◉</span><strong>Hold or toggle to speak</strong>
+    const petals = this.#orbState.petals
+      .map(
+        (petal, index) => `<li style="--petal-index:${index};--petal-count:${this.#orbState.petals.length}">
+          <button type="button" class="orb-petal${petal.id === this.#orbState.highlighted ? " highlighted" : ""}"
+            data-orb-petal data-action="${petal.id}" aria-pressed="${
+              petal.id === this.#orbState.highlighted
+            }" ${petal.enabled ? "" : "disabled"}>
+            <span>${escapeHtml(petal.label)}</span><small>${escapeHtml(petal.kind)}</small>
           </button>
-          <p id="talk-help" class="fine">${this.#voice.available ? "Speech recognition available." : "Speech recognition unavailable; type below."}</p>
-          <form id="command-form" class="command-bar">
-            <label class="sr-only" for="command-input">Pocket GM command</label>
-            <input id="command-input" name="command" autocomplete="off" placeholder="Begin quest, what is my turn, offer…, recap, sync…" required>
-            <button class="button primary" type="submit">Ask</button>
-          </form>
-          <output id="gm-output" class="gm-output" tabindex="-1" aria-live="polite">${escapeHtml(
-            this.#voiceOutput || "Say “begin quest” or use the controls below.",
-          )}</output>
+        </li>`,
+      )
+      .join("");
+    const pendingCard = pending
+      ? `<section class="proposal-card" aria-labelledby="proposal-title">
+          <p class="eyebrow">Frozen local proposal • no event yet</p>
+          <h2 id="proposal-title" tabindex="-1">Review &amp; sign</h2>
+          <p>${escapeHtml(pending.preview)}</p>
+          <dl>
+            <div><dt>Event</dt><dd><code>${escapeHtml(pending.eventType)}</code></dd></div>
+            <div><dt>Binding</dt><dd>Circle + current event root + state digest</dd></div>
+            <div><dt>Expires</dt><dd>${new Date(pending.expiresAt).toLocaleTimeString()}</dd></div>
+          </dl>
+          <details><summary>Exact canonical payload</summary><pre>${escapeHtml(
+            pending.canonicalPayload,
+          )}</pre></details>
+          <p class="fine">This separate confirmation reloads the Circle, checks authorization and the frozen binding,
+          sanitizes the exact payload, then creates at most one signed event. Highlighting never signs.</p>
+          <div class="button-row">
+            <button id="review-sign-proposal" class="button primary" type="button" ${
+              pending.expiresAt <= Date.now() ? "disabled" : ""
+            }>Review &amp; sign this exact proposal</button>
+            <button id="cancel-proposal" class="button quiet" type="button">Cancel — create zero events</button>
+          </div>
+        </section>`
+      : "";
+    const newQuestTunnel =
+      this.#orbState.mode === "tunnel" && tunnel === "New Quest"
+        ? `<form id="quest-draft-form" class="card inline-form">
+            <p class="eyebrow">Tunnel • step 1 of 2 • offline</p>
+            <h2>Draft a deterministic quest</h2>
+            <label>Place class <select name="context">
+              <option>indoors</option><option>doorstep</option><option>park</option><option>street</option>
+              <option>transit</option><option>waterside</option><option>unknown</option>
+            </select></label>
+            <label>Weather band <select name="weather">
+              <option>clear</option><option>clouded</option><option>rain</option><option>snow</option>
+              <option>wind</option><option>warm</option><option>cold</option><option>unknown</option>
+            </select></label>
+            <button class="button primary" type="submit">Stage offline quest for review</button>
+          </form>`
+        : "";
+    const offeringTunnel =
+      this.#orbState.mode === "tunnel" && tunnel === "Offer" && quest && !ownOffering
+        ? `<form id="offering-draft-form" class="card form-grid">
+            <p class="eyebrow">Tunnel • offering draft</p>
+            <h2>Draft your bounded offering</h2>
+            <label>Offering <textarea name="text" maxlength="600" required></textarea></label>
+            <label>Choice left for the next lobe
+              <input name="choice" maxlength="48" required placeholder="follow the warm echo">
+            </label>
+            <label>Optional companion trait <select name="trait"><option value="">None</option>
+              <option>${escapeHtml(this.#identityRequired().companion.temperament)}</option>
+              <option>patience</option><option>mischief</option><option>care</option></select></label>
+            <label class="check"><input name="context" type="checkbox"> Include broad place class (never coordinates)</label>
+            <label class="check"><input name="approved" type="checkbox"> Separately select this text for the portable heirloom</label>
+            <button class="button primary" type="submit">Stage offering — do not sign</button>
+          </form>`
+        : "";
+    const devicePanel = this.#deviceCode
+      ? `<section class="device-code-panel" aria-labelledby="device-code-title">
+          <h3 id="device-code-title">Connect GitHub Copilot</h3>
+          <p>Sign-in sends no Circle content. Open GitHub and enter:</p>
+          <strong class="device-code">${escapeHtml(this.#deviceCode.userCode)}</strong>
+          <a class="button primary" href="${escapeHtml(
+            this.#deviceCode.verificationUrl,
+          )}" target="_blank" rel="noreferrer noopener">Open GitHub verification</a>
+          <button id="cancel-device-login" class="button quiet" type="button">Cancel sign-in</button>
+        </section>`
+      : "";
+    const mindTunnel =
+      this.#orbState.mode === "tunnel" && tunnel === "Mind"
+        ? `<section class="mind-panel card">
+            <p class="eyebrow">Tunnel • optional remote mind</p>
+            <h2>Copilot narrator/planner</h2>
+            <p>Offline quest templates remain authoritative and available. Copilot has no event, signing, storage,
+            PeerJS, reunion, key, or heirloom tool.</p>
+            ${
+              this.#intelligence.authenticated
+                ? `<form id="ai-draft-form" class="form-grid">
+                    <label>Your current draft (maximum 600 characters)
+                      <textarea name="draft" maxlength="600" required></textarea>
+                    </label>
+                    <button class="button" type="submit">Build exact context preview</button>
+                  </form>`
+                : `<button id="start-device-login" class="button primary" type="button">Sign in with GitHub device code</button>`
+            }
+            ${devicePanel}
+          </section>`
+        : "";
+    const aiPreviewCard = this.#aiPreview
+      ? `<section class="ai-preview-card" aria-labelledby="ai-preview-title">
+          <p class="eyebrow">Exact remote context preview • ${this.#aiPreview.bytes.byteLength} / 4096 bytes</p>
+          <h2 id="ai-preview-title" tabindex="-1">Approve this bounded projection?</h2>
+          <p><strong>Recipients:</strong> ${REMOTE_RECIPIENT_CHAIN}</p>
+          <pre>${escapeHtml(this.#aiPreview.text)}</pre>
+          <p class="fine">Excluded: IDs, names/oath, keys/signatures/hashes/roots/timestamps, roster/order, invites/PIN,
+          PeerJS and Kited fields, raw audio/location/memories/history, unselected offerings, peer text, and heirloom bytes.</p>
+          <div class="button-row">
+            <button id="approve-ai-preview" class="button primary" type="button" ${
+              this.#intelligence.authenticated && !this.#aiStreaming ? "" : "disabled"
+            }>Approve exact bytes &amp; send</button>
+            <button id="cancel-ai-preview" class="button quiet" type="button">Cancel preview</button>
+          </div>
+        </section>`
+      : "";
+    const aiDraftCard =
+      this.#aiPreview || this.#aiDraft || this.#aiStreaming
+        ? `<section class="ai-draft-card" aria-labelledby="ai-draft-title">
+            <p class="eyebrow">Remote Copilot mode • untrusted draft</p>
+            <h2 id="ai-draft-title">Narrator draft</h2>
+            <output id="ai-draft-output" aria-live="polite">${escapeHtml(
+              this.#aiDraft ||
+                (this.#aiStreaming
+                  ? "Streaming an untrusted draft…"
+                  : "Awaiting explicit context approval."),
+            )}</output>
+            <p class="fine">This text cannot execute commands or mutate the Circle.</p>
+            ${
+              this.#aiDraft && !this.#aiStreaming
+                ? `<details class="ai-spoken-caption">
+                    <summary>Spoken version</summary>
+                    <p id="ai-spoken-caption">${escapeHtml(
+                      this.#aiVoice ||
+                        "Spoken version unavailable because the response did not include a usable voice section.",
+                    )}</p>
+                  </details>`
+                : ""
+            }
+            <button id="stage-ai-offering" class="button" type="button" ${
+              !quest || this.#aiStreaming || !this.#aiDraft || this.#aiDraft.length > 600 ? "hidden" : ""
+            }>Stage this exact draft as an offering</button>
+          </section>`
+        : "";
+    return `
+      <section class="route adaptive-orb-route" aria-labelledby="gm-title">
+        <div class="title-row"><div><p class="eyebrow">Adaptive Orb • Pocket Quest Master</p>
+          <h1 id="gm-title" tabindex="-1">Talk with the Circle organism</h1></div>
+          <div class="mind-account">
+            <span class="account-chip">${this.#intelligence.authenticated ? "Copilot connected • memory only" : "Offline mind"}</span>
+            ${
+              this.#intelligence.authenticated
+                ? '<button id="mind-logout" class="button quiet" type="button">Log out Copilot</button>'
+                : ""
+            }
+          </div>
+        </div>
+        <p>Orbit is the default conversation. Compass holds bounded choices. Tunnel carries multi-step drafts.
+        Center always cancels/rests safely; a highlight is never consent.</p>
+        <nav class="orb-breadcrumb" aria-label="Adaptive Orb mode">${this.#orbState.breadcrumb
+          .map((item) => `<span>${escapeHtml(item)}</span>`)
+          .join("<span aria-hidden=\"true\">›</span>")}</nav>
+        <section class="adaptive-orb" style="--orb-hue:${organism?.hue ?? 265};--orb-glow:${(
+          0.1 +
+          (organism?.aura ?? 0.5) * 0.18
+        ).toFixed(3)};--orb-breath:${(6.4 - (organism?.motion ?? 0.5) * 2).toFixed(
+          2,
+        )}s" aria-label="Adaptive Orb actions">
+          <button id="orb-center" class="orb-center" type="button" aria-label="Center: cancel current draft and rest safely">
+            <span class="orb-core" aria-hidden="true"><i></i><i></i><i></i></span>
+            <strong>Center</strong><small>safe cancel / rest</small>
+          </button>
+          <ol class="orb-petals">${petals}</ol>
         </section>
-        ${
-          quest
-            ? leg
-            : `<section class="card"><h2>Begin from nearby context</h2>
-                <p>Only broad local classes are committed—never exact GPS.</p></section>`
-        }
-        <form id="quest-form" class="card inline-form">
-          <label>Place class <select name="context">
-            <option>indoors</option><option>doorstep</option><option>park</option><option>street</option>
-            <option>transit</option><option>waterside</option><option>unknown</option>
-          </select></label>
-          <label>Weather band <select name="weather">
-            <option>clear</option><option>clouded</option><option>rain</option><option>snow</option>
-            <option>wind</option><option>warm</option><option>cold</option><option>unknown</option>
-          </select></label>
-          <label class="check"><input name="localModel" type="checkbox"> Experimental browser-built-in LanguageModel rewrite (local, optional)</label>
-          <button class="button" type="submit">${quest ? "Create another quest" : "Create quest"}</button>
-        </form>
-        ${
-          quest && !ownOffering
-            ? `<form id="offering-form" class="card form-grid">
-                <h2>Complete your leg</h2>
-                <label>Your bounded offering <textarea name="text" maxlength="600" required></textarea></label>
-                <label>Choice left for the next lobe <input name="choice" maxlength="48" required placeholder="follow the warm echo"></label>
-                <label>Optional companion trait <select name="trait"><option value="">None</option>
-                  <option>${escapeHtml(this.#identityRequired().companion.temperament)}</option>
-                  <option>patience</option><option>mischief</option><option>care</option></select></label>
-                <label class="check"><input name="context" type="checkbox"> Include broad place class (never coordinates)</label>
-                <label class="check"><input name="approved" type="checkbox"> Select this text for the portable heirloom</label>
-                <div class="button-row"><button class="button primary" type="submit">Sign and offer</button>
-                <button id="rest-turn" class="button quiet" type="button">Rest without guilt</button></div>
-              </form>`
-            : quest
-              ? `<section class="card"><h2>Your offering is in the Braid</h2><p>Status: ready-not-sent until a sync/file exchange; no streak and no leaderboard.</p></section>`
-              : ""
-        }
+        <section class="orb-conversation" aria-labelledby="caption-title">
+          <div class="caption-heading"><h2 id="caption-title">Persistent caption</h2>
+            <span class="mode-chip">${escapeHtml(this.#orbState.mode)}</span></div>
+          <output id="orb-caption" tabindex="-1" aria-live="polite">${escapeHtml(
+            this.#voiceOutput ||
+              "Offline and ready. Highlight a petal, then explicitly Confirm; or type a message or command.",
+          )}</output>
+          <p id="orb-highlight" class="highlight-status">Highlighted: ${
+            selected ? escapeHtml(selected.label) : "Center (safe cancel)"
+          }. Not activated.</p>
+          <div class="button-row orb-explicit-controls">
+            <button id="confirm-highlight" class="button primary" type="button">Confirm highlighted action</button>
+            <button id="cancel-orb" class="button quiet" type="button">Cancel / center</button>
+            <button id="undo-orb" class="button quiet" type="button">Undo draft</button>
+          </div>
+        </section>
+        <section class="input-parity card">
+          <h2>Message or command</h2>
+          <p class="network-warning"><strong>Browser speech warning:</strong> recognition may use your browser or
+          operating-system network service even when local processing is requested. No raw audio is kept by Rapp Heir.</p>
+          <div class="voice-command-row">
+            <button id="push-to-talk" class="talk-button" aria-describedby="talk-help" aria-pressed="false">
+              <span aria-hidden="true">◉</span><strong>Hold or toggle to speak</strong>
+            </button>
+            <p id="talk-help" class="fine">${
+              this.#voice.available
+                ? "Speech recognition available. Push-to-talk interrupts speech output."
+                : "Speech recognition unavailable; typed/touch/keyboard controls have full parity."
+            }</p>
+          </div>
+          <form id="command-form" class="command-bar">
+            <label class="sr-only" for="command-input">Message or command</label>
+            <input id="command-input" name="command" maxlength="600" autocomplete="off"
+              placeholder="Message or command: my turn, new quest, offer…, recap, stop" required>
+            <button class="button primary" type="submit">Submit</button>
+          </form>
+        </section>
+        ${pendingCard}
+        ${newQuestTunnel}
+        ${offeringTunnel}
+        ${mindTunnel}
+        ${aiPreviewCard}
+        ${aiDraftCard}
+        ${leg || '<section class="card"><h2>No active quest</h2><p>Use New Quest for an offline deterministic template.</p></section>'}
         ${
           group.demo && quest
             ? `<section class="card demo-card"><h2>Practice companion</h2>
-                <p>Morrow is simulated on this device. Its key cannot prove another person was present.</p>
-                <button id="demo-offering" class="button">Let Morrow answer the changed leg</button></section>`
+                <p>Morrow is simulated on this device. Its key cannot prove another person was present. Its answer is
+                also staged and separately reviewed before that demo key signs.</p>
+                <form id="demo-offering-form" class="form-grid">
+                  <label class="check"><input name="approved" type="checkbox"> Separately select Morrow’s simulated
+                  text for the portable heirloom</label>
+                  <button class="button" type="submit">Stage Morrow’s offline answer</button>
+                </form></section>`
             : ""
         }
         ${
@@ -590,12 +841,23 @@ export class RappHeirApp {
             ? `<section class="card">
                 <h2>Shared reveal</h2>
                 <p>${new Set(offerings.map((event) => event.body.memberId)).size} distinct member offering(s) received.</p>
-                <button id="create-reveal" class="button" ${
+                <button id="stage-reveal" class="button" ${
                   new Set(offerings.map((event) => event.body.memberId)).size < 2 ? "disabled" : ""
-                }>Reveal how each changed the story</button>
+                }>Stage shared reveal for review</button>
               </section>`
             : ""
         }
+        <section class="camera-assist card">
+          <h2>Experimental camera highlight assist</h2>
+          <p>Explicit opt-in requests video only—never audio. FaceDetector maps one face to four coarse directions or
+          center. A 1.2-second dwell can only highlight/arm; it can never Confirm, sign, or send.</p>
+          <div class="button-row"><button id="enable-camera-assist" class="button" type="button">Enable camera assist</button>
+          <button id="disable-camera-assist" class="button quiet" type="button">Disable camera assist</button></div>
+          <video id="orb-camera-preview" class="camera-preview" muted playsinline hidden></video>
+          <p class="fine">No pixels, vectors, direction history, or camera output are stored, logged, networked, AI-sent, or exported.</p>
+        </section>
+        <p class="keyboard-help">Keyboard: ←/→ rotate highlight, Enter confirms, Escape centers, U/Backspace undo,
+        R repeats, and Space toggles push-to-talk outside controls.</p>
         <a class="button quiet" href="#/circle/${escapeHtml(group.id)}">Back to organism</a>
       </section>`;
   }
@@ -848,6 +1110,7 @@ export class RappHeirApp {
     const groupId = route.path.startsWith("/play/") ? route.path.slice("/play/".length) : "";
     if (!groupId) return;
     const talk = document.querySelector<HTMLButtonElement>("#push-to-talk");
+    let globalKeyDown: ((event: KeyboardEvent) => void) | undefined;
     if (talk) {
       let pointerId: number | undefined;
       let keyboardCode = "";
@@ -898,7 +1161,48 @@ export class RappHeirApp {
         else startListening();
       };
       const stopWhenHidden = (): void => {
-        if (document.visibilityState !== "visible") stopListening();
+        if (document.visibilityState !== "visible") {
+          this.#voice.abortListening();
+          setPressed(false);
+          this.#disableCameraAssist();
+        }
+      };
+      const stopForPage = (): void => {
+        this.#voice.abortListening();
+        setPressed(false);
+        this.#disableCameraAssist();
+      };
+      globalKeyDown = (event: KeyboardEvent): void => {
+        if (event.repeat || shouldIgnoreOrbShortcut(event.target)) return;
+        if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+          event.preventDefault();
+          this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: -1 });
+          this.#paintOrbHighlight();
+        } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+          event.preventDefault();
+          this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: 1 });
+          this.#paintOrbHighlight();
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          void this.#activateHighlighted("keyboard");
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          void this.#cancelOrb();
+        } else if (event.key.toLocaleLowerCase() === "u" || event.key === "Backspace") {
+          event.preventDefault();
+          void this.#undoOrb();
+        } else if (event.key.toLocaleLowerCase() === "r") {
+          event.preventDefault();
+          void this.#handleOrbInput("repeat", "keyboard");
+        } else if (event.code === "Space") {
+          event.preventDefault();
+          if (talk.getAttribute("aria-pressed") === "true") {
+            this.#voice.abortListening();
+            setPressed(false);
+          } else {
+            startListening();
+          }
+        }
       };
       talk.addEventListener("pointerdown", pointerDown);
       talk.addEventListener("keydown", keyDown);
@@ -908,8 +1212,9 @@ export class RappHeirApp {
       window.addEventListener("pointercancel", pointerRelease, true);
       window.addEventListener("keyup", keyUp, true);
       document.addEventListener("visibilitychange", stopWhenHidden);
-      window.addEventListener("pagehide", stopListening);
-      window.addEventListener("blur", stopListening);
+      document.addEventListener("keydown", globalKeyDown);
+      window.addEventListener("pagehide", stopForPage);
+      window.addEventListener("blur", stopForPage);
       this.#talkCleanup = () => {
         talk.removeEventListener("pointerdown", pointerDown);
         talk.removeEventListener("keydown", keyDown);
@@ -919,29 +1224,129 @@ export class RappHeirApp {
         window.removeEventListener("pointercancel", pointerRelease, true);
         window.removeEventListener("keyup", keyUp, true);
         document.removeEventListener("visibilitychange", stopWhenHidden);
-        window.removeEventListener("pagehide", stopListening);
-        window.removeEventListener("blur", stopListening);
-        stopListening();
+        if (globalKeyDown) document.removeEventListener("keydown", globalKeyDown);
+        window.removeEventListener("pagehide", stopForPage);
+        window.removeEventListener("blur", stopForPage);
+        this.#voice.abortListening();
+        this.#disableCameraAssist();
       };
     }
+    document.querySelectorAll<HTMLButtonElement>("[data-orb-petal]").forEach((button) => {
+      button.addEventListener("click", () => {
+        this.#orbState = adaptiveOrbReducer(this.#orbState, {
+          type: "highlight",
+          action: button.dataset.action as OrbActionId,
+        });
+        this.#paintOrbHighlight();
+      });
+      button.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+          event.preventDefault();
+          this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: -1 });
+          this.#paintOrbHighlight();
+        } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+          event.preventDefault();
+          this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: 1 });
+          this.#paintOrbHighlight();
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          this.#orbState = adaptiveOrbReducer(this.#orbState, {
+            type: "highlight",
+            action: button.dataset.action as OrbActionId,
+          });
+          void this.#activateHighlighted("keyboard");
+        }
+      });
+    });
+    document.querySelector("#orb-center")?.addEventListener("click", () => void this.#cancelOrb());
+    document
+      .querySelector("#confirm-highlight")
+      ?.addEventListener("click", () => void this.#activateHighlighted("confirm-control"));
+    document.querySelector("#cancel-orb")?.addEventListener("click", () => void this.#cancelOrb());
+    document.querySelector("#undo-orb")?.addEventListener("click", () => void this.#undoOrb());
     document.querySelector<HTMLFormElement>("#command-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       const form = currentForm(event);
       const command = fieldValue(form, "command");
       form.reset();
-      void this.#runPocketCommand(command);
+      void this.#handleOrbInput(command, "typed");
     });
-    document.querySelector<HTMLFormElement>("#quest-form")?.addEventListener("submit", (event) => {
+    document.querySelector<HTMLFormElement>("#quest-draft-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
-      void this.#beginQuest(groupId, currentForm(event));
+      this.#runOrbTask(
+        this.#stageQuestProposal(groupId, currentForm(event), "touch", this.#nextUserTurn()),
+      );
     });
-    document.querySelector<HTMLFormElement>("#offering-form")?.addEventListener("submit", (event) => {
+    document.querySelector<HTMLFormElement>("#offering-draft-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
-      void this.#submitOffering(groupId, currentForm(event));
+      this.#runOrbTask(
+        this.#stageOfferingProposal(
+          groupId,
+          currentForm(event),
+          undefined,
+          "touch",
+          this.#nextUserTurn(),
+        ),
+      );
     });
-    document.querySelector("#rest-turn")?.addEventListener("click", () => void this.#rest(groupId));
-    document.querySelector("#demo-offering")?.addEventListener("click", () => void this.#demoOffer(groupId));
-    document.querySelector("#create-reveal")?.addEventListener("click", () => void this.#reveal(groupId));
+    document
+      .querySelector("#review-sign-proposal")
+      ?.addEventListener("click", () => void this.#confirmPendingProposal(this.#nextUserTurn()));
+    document.querySelector("#cancel-proposal")?.addEventListener("click", () => void this.#cancelOrb());
+    document.querySelector<HTMLFormElement>("#demo-offering-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const form = currentForm(event);
+      void this.#stageDemoOffering(
+        groupId,
+        this.#nextUserTurn(),
+        (form.elements.namedItem("approved") as HTMLInputElement).checked,
+      );
+    });
+    document
+      .querySelector("#stage-reveal")
+      ?.addEventListener("click", () =>
+        this.#runOrbTask(this.#stageRevealProposal(groupId, "touch", this.#nextUserTurn())),
+      );
+    document
+      .querySelector("#start-device-login")
+      ?.addEventListener("click", () => void this.#startDeviceLogin());
+    document.querySelector("#cancel-device-login")?.addEventListener("click", () => {
+      this.#loginUiGeneration += 1;
+      this.#intelligence.cancelDeviceLogin();
+      this.#deviceCode = undefined;
+      this.#setStatus("GitHub device sign-in cancelled. Nothing was stored.");
+      void this.render();
+    });
+    document.querySelector("#mind-logout")?.addEventListener("click", () => void this.#logoutMind());
+    document.querySelector<HTMLFormElement>("#ai-draft-form")?.addEventListener("submit", (event) => {
+      event.preventDefault();
+      this.#runOrbTask(
+        this.#prepareAiPreview(groupId, fieldValue(currentForm(event), "draft")),
+      );
+    });
+    document
+      .querySelector("#approve-ai-preview")
+      ?.addEventListener("click", () => void this.#sendApprovedAiPreview());
+    document.querySelector("#cancel-ai-preview")?.addEventListener("click", () => {
+      this.#aiPreview = undefined;
+      this.#aiVoice = "";
+      this.#aiUiGeneration += 1;
+      this.#intelligence.abortChat();
+      this.#loginUiGeneration += 1;
+      this.#intelligence.cancelDeviceLogin();
+      this.#deviceCode = undefined;
+      this.#setStatus("Remote context preview cancelled; zero bytes were sent.");
+      void this.render();
+    });
+    document
+      .querySelector("#stage-ai-offering")
+      ?.addEventListener("click", () => void this.#stageAiOffering(groupId, this.#nextUserTurn()));
+    document
+      .querySelector("#enable-camera-assist")
+      ?.addEventListener("click", () => void this.#enableCameraAssist());
+    document
+      .querySelector("#disable-camera-assist")
+      ?.addEventListener("click", () => this.#disableCameraAssist(true));
   }
 
   #bindReunion(route: ReturnType<typeof routeParts>): void {
@@ -1108,6 +1513,7 @@ export class RappHeirApp {
     const video = document.querySelector<HTMLVideoElement>("#scanner-video");
     if (!video) return;
     try {
+      this.#disableCameraAssist();
       await this.#scanner.start(video, (text) => void this.#joinFromInput(text), (text) => this.#setStatus(text));
     } catch (error) {
       this.#setStatus(`Camera unavailable: ${this.#error(error)}. Paste, type, or load a file instead.`);
@@ -1214,108 +1620,422 @@ export class RappHeirApp {
     }
   }
 
-  async #beginQuest(groupId: string, form?: HTMLFormElement): Promise<void> {
-    try {
-      const [group, events] = await Promise.all([
-        getCircle(this.#db(), groupId),
-        getCircleEvents(this.#db(), groupId),
-      ]);
-      if (!group) throw new Error("Circle missing");
-      const context = form ? fieldValue(form, "context") : "unknown";
-      const weather = form ? fieldValue(form, "weather") : "unknown";
-      const quest = await createQuest(group, events, context, weather);
-      const modelEnabled = form
-        ? (form.elements.namedItem("localModel") as HTMLInputElement).checked
-        : false;
-      const enhanced = await optionallyEnhancePrompt(quest.premise, modelEnabled);
-      const committed: Quest = { ...quest, premise: enhanced.text };
-      await appendLocalEvent(this.#db(), group.id, this.#identityRequired(), "quest.created", {
-        ...questPayload(committed),
-        promptSource: enhanced.source,
-      });
-      this.#voiceOutput = `${committed.title}. ${committed.premise}`;
-      this.#voice.speak(this.#voiceOutput);
-      this.#setStatus("Quest signed locally. It is ready-not-sent until sync or pack exchange.");
-      await this.render();
-    } catch (error) {
-      this.#setStatus(this.#error(error));
+  #nextUserTurn(): number {
+    this.#userTurn += 1;
+    return this.#userTurn;
+  }
+
+  #runOrbTask(task: Promise<void>): void {
+    void task.catch((error: unknown) => this.#setAlert(this.#error(error)));
+  }
+
+  #proposalOrigin(source: OrbUserSource): ProposalOrigin {
+    return source === "typed" ? "typed" : source === "voice" ? "voice" : source;
+  }
+
+  #paintOrbHighlight(extra = ""): void {
+    const selected = highlightedPetal(this.#orbState);
+    document.querySelectorAll<HTMLButtonElement>("[data-orb-petal]").forEach((button) => {
+      const highlighted = button.dataset.action === this.#orbState.highlighted;
+      button.classList.toggle("highlighted", highlighted);
+      button.setAttribute("aria-pressed", String(highlighted));
+    });
+    const status = document.querySelector<HTMLElement>("#orb-highlight");
+    if (status) {
+      status.textContent = `Highlighted: ${
+        selected?.label ?? "Center (safe cancel)"
+      }. Not activated.${extra ? ` ${extra}` : ""}`;
     }
   }
 
-  async #submitOffering(groupId: string, form: HTMLFormElement, commandText?: string): Promise<void> {
+  async #activateHighlighted(source: OrbActivation["source"], turn?: number): Promise<void> {
+    this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "confirm", source });
+    const activation = this.#orbState.activation;
+    this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "clear-activation" });
+    if (!activation) {
+      await this.#cancelOrb();
+      return;
+    }
+    await this.#activateOrbAction(
+      activation.action,
+      source === "voice" ? "voice" : source === "keyboard" ? "keyboard" : "touch",
+      turn ?? this.#nextUserTurn(),
+    );
+  }
+
+  async #activateOrbAction(
+    action: OrbActionId,
+    source: OrbUserSource,
+    turn: number,
+  ): Promise<void> {
+    const path = routeParts().path;
+    const groupId = path.startsWith("/play/") ? path.slice("/play/".length) : "";
+    if (!groupId) return;
     try {
-      const [group, events] = await Promise.all([
-        getCircle(this.#db(), groupId),
-        getCircleEvents(this.#db(), groupId),
-      ]);
-      if (!group) throw new Error("Circle missing");
-      const quest = latestQuest(events);
-      if (!quest) throw new Error("Begin a quest first");
-      if (
-        events.some(
-          (event) =>
-            event.body.type === "quest.offering" &&
-            event.body.payload.questId === quest.questId &&
-            event.body.memberId === this.#identityRequired().memberId,
-        )
-      ) {
-        throw new Error("This companion has already offered to this quest");
+      if (action === "continue") {
+        await this.#runReadOnly(groupId, { type: "turn" });
+      } else if (action === "new-quest") {
+        this.#orbState = adaptiveOrbReducer(this.#orbState, {
+          type: "enter",
+          mode: "tunnel",
+          label: "New Quest",
+        });
+        this.#voiceOutput = "Quest tunnel opened. Choose broad context, then stage a proposal.";
+        await this.render();
+      } else if (action === "offer") {
+        this.#orbState = adaptiveOrbReducer(this.#orbState, {
+          type: "enter",
+          mode: "tunnel",
+          label: "Offer",
+        });
+        this.#voiceOutput = "Offering tunnel opened. Drafting creates no signed event.";
+        await this.render();
+      } else if (action === "recap") {
+        await this.#runReadOnly(groupId, { type: "recap" });
+      } else if (action === "rest") {
+        await this.#stageRestProposal(groupId, this.#proposalOrigin(source), turn);
+      } else if (action === "sync") {
+        this.#setStatus("Choose Fresh sync QR; no known peer is silently trusted.");
+        this.#navigate(`/circle/${groupId}`);
+      } else if (action === "reunion") {
+        this.#navigate(`/reunion/${groupId}`);
+      } else {
+        this.#orbState = adaptiveOrbReducer(this.#orbState, {
+          type: "enter",
+          mode: "tunnel",
+          label: "Mind",
+        });
+        this.#voiceOutput = this.#intelligence.authenticated
+          ? "Remote mind tunnel opened. A message first becomes an exact context preview."
+          : "Sign-in tunnel opened. Device sign-in sends zero Circle content.";
+        await this.render();
       }
-      const offering = sanitizeOffering(
-        {
-          questId: quest.questId,
-          memberId: this.#identityRequired().memberId,
-          text: commandText ?? fieldValue(form, "text"),
-          choice: commandText ? "carry the spoken thread" : fieldValue(form, "choice"),
-          selectedTrait: commandText ? undefined : fieldValue(form, "trait") || undefined,
-          contextClass:
-            !commandText && (form.elements.namedItem("context") as HTMLInputElement).checked
-              ? quest.contextClass
-              : undefined,
-          approvedForHeirloom:
-            !commandText && (form.elements.namedItem("approved") as HTMLInputElement).checked,
-        },
-        group,
-      );
-      await appendLocalEvent(
-        this.#db(),
-        group.id,
-        this.#identityRequired(),
-        "quest.offering",
-        offeringPayload(offering),
-      );
-      this.#voiceOutput = "Offering signed. It will materially change the next lobe’s turn after merge.";
-      this.#setStatus("Offering ready-not-sent. Sync or export a pack when ready.");
-      await this.render();
     } catch (error) {
-      this.#setStatus(this.#error(error));
+      this.#setAlert(this.#error(error));
     }
   }
 
-  async #rest(groupId: string): Promise<void> {
+  async #cancelOrb(): Promise<void> {
+    this.#proposalGate.cancel();
+    this.#aiPreview = undefined;
+    this.#aiVoice = "";
+    this.#aiUiGeneration += 1;
+    this.#intelligence.abortChat();
+    this.#loginUiGeneration += 1;
+    this.#intelligence.cancelDeviceLogin();
+    this.#deviceCode = undefined;
+    this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "cancel" });
+    this.#voiceOutput = "Centered safely. Drafts were cancelled and zero events were created.";
+    this.#focusAfterRender = "#orb-center";
+    this.#setStatus(this.#voiceOutput);
+    await this.render();
+  }
+
+  async #undoOrb(): Promise<void> {
+    this.#proposalGate.cancel();
+    this.#aiPreview = undefined;
+    this.#aiVoice = "";
+    this.#aiUiGeneration += 1;
+    this.#intelligence.abortChat();
+    this.#loginUiGeneration += 1;
+    this.#intelligence.cancelDeviceLogin();
+    this.#deviceCode = undefined;
+    this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "undo" });
+    this.#voiceOutput = "Undid the current draft step. No event was created.";
+    this.#focusAfterRender = "#orb-caption";
+    this.#setStatus(this.#voiceOutput);
+    await this.render();
+  }
+
+  async #handleOrbInput(input: string, source: OrbUserSource): Promise<void> {
+    const path = routeParts().path;
+    const groupId = path.startsWith("/play/") ? path.slice("/play/".length) : "";
+    if (!groupId) {
+      this.#setStatus("Open a Circle’s Pocket Quest Master to use game commands.");
+      return;
+    }
+    const turn = this.#nextUserTurn();
+    const intent = parseOrbInput(input, {
+      source: "user",
+      petals: this.#orbState.petals,
+    });
     try {
-      const quest = latestQuest(await getCircleEvents(this.#db(), groupId));
-      if (!quest) throw new Error("No quest is active");
-      await appendLocalEvent(this.#db(), groupId, this.#identityRequired(), "quest.rest", {
+      if (intent.kind === "stop") {
+        this.#voice.stopAll();
+        this.#aiUiGeneration += 1;
+        this.#intelligence.abortChat();
+        this.#loginUiGeneration += 1;
+        this.#intelligence.cancelDeviceLogin();
+        this.#deviceCode = undefined;
+        this.#aiStreaming = false;
+        this.#aiVoice = "";
+        document.querySelector(".device-code-panel")?.remove();
+        document.querySelector("#push-to-talk")?.setAttribute("aria-pressed", "false");
+        this.#setAlert("Stopped microphone, speech, and remote request. Stale callbacks are ignored.");
+      } else if (intent.kind === "cancel") {
+        await this.#cancelOrb();
+      } else if (intent.kind === "undo") {
+        await this.#undoOrb();
+      } else if (intent.kind === "confirm-pending") {
+        if (this.#proposalGate.pending) {
+          await this.#confirmPendingProposal(turn);
+        } else {
+          await this.#activateHighlighted(
+            source === "voice" ? "voice" : source === "keyboard" ? "keyboard" : "confirm-control",
+            turn,
+          );
+        }
+      } else if (intent.kind === "read-only") {
+        await this.#runReadOnly(groupId, intent.command);
+      } else if (intent.kind === "mutating") {
+        if (intent.command.type === "create-quest") {
+          await this.#stageQuestProposal(
+            groupId,
+            undefined,
+            this.#proposalOrigin(source),
+            turn,
+          );
+        } else if (intent.command.type === "offer") {
+          if (!intent.command.text) {
+            this.#orbState = adaptiveOrbReducer(this.#orbState, {
+              type: "enter",
+              mode: "tunnel",
+              label: "Offer",
+            });
+            this.#voiceOutput = "Draft the offering, then stage it. Voice never auto-commits.";
+            await this.render();
+          } else {
+            await this.#stageOfferingProposal(
+              groupId,
+              undefined,
+              intent.command.text,
+              this.#proposalOrigin(source),
+              turn,
+            );
+          }
+        } else if (intent.command.type === "rest") {
+          await this.#stageRestProposal(groupId, this.#proposalOrigin(source), turn);
+        } else {
+          await this.#stageRevealProposal(groupId, this.#proposalOrigin(source), turn);
+        }
+      } else if (intent.kind === "navigation") {
+        if (intent.command.type === "sync") {
+          this.#setStatus("Choose Fresh sync QR; no known peer is silently trusted.");
+          this.#navigate(`/circle/${groupId}`);
+        } else {
+          this.#navigate(`/reunion/${groupId}`);
+        }
+      } else if (intent.kind === "petal") {
+        this.#orbState = adaptiveOrbReducer(this.#orbState, {
+          type: "highlight",
+          action: intent.petalId as OrbActionId,
+        });
+        this.#paintOrbHighlight("Say “confirm,” press Enter, or use the Confirm control to activate.");
+      } else if (intent.kind === "freeform-ai") {
+        await this.#prepareAiPreview(groupId, intent.text);
+      }
+    } catch (error) {
+      this.#setAlert(this.#error(error));
+    }
+  }
+
+  async #runReadOnly(
+    groupId: string,
+    command: Extract<PocketCommand, { type: "turn" | "recap" | "help" | "repeat" }>,
+  ): Promise<void> {
+    if (command.type === "repeat") {
+      this.#voice.repeat();
+      return;
+    }
+    if (command.type === "help") {
+      this.#voiceOutput =
+        "Try: my turn, new quest, offer…, rest, reveal, recap, sync, reunion, mind, confirm, cancel, undo, repeat, or stop.";
+    } else if (command.type === "turn") {
+      const events = await getCircleEvents(this.#db(), groupId);
+      const quest = latestQuest(events);
+      if (!quest) throw new Error("No quest yet. Highlight New Quest, then confirm.");
+      const leg = await deriveQuestLeg(quest, this.#identityRequired().memberId, events);
+      this.#voiceOutput = `${leg.role}, ${leg.minutes} minutes. ${leg.prompt}`;
+    } else {
+      const events = await getCircleEvents(this.#db(), groupId);
+      const reveal = events
+        .filter((event) => event.body.type === "quest.reveal")
+        .sort(
+          (left, right) =>
+            left.body.createdAt.localeCompare(right.body.createdAt) ||
+            left.id.localeCompare(right.id),
+        )
+        .at(-1);
+      this.#voiceOutput = reveal
+        ? String(reveal.body.payload.text)
+        : "No signed shared reveal has arrived yet.";
+    }
+    this.#voice.speak(this.#voiceOutput);
+    await this.render();
+  }
+
+  async #proposalState(groupId: string): Promise<{
+    group: CircleRecord;
+    events: Awaited<ReturnType<typeof getCircleEvents>>;
+    binding: ProposalBinding;
+  }> {
+    const [group, events] = await Promise.all([
+      getCircle(this.#db(), groupId),
+      getCircleEvents(this.#db(), groupId),
+    ]);
+    if (!group) throw new Error("Circle missing");
+    const root = await eventRoot(events);
+    return {
+      group,
+      events,
+      binding: {
+        circleId: group.id,
+        eventRoot: root,
+        stateDigest: await stateDigestForProposal(group, root),
+      },
+    };
+  }
+
+  async #stageEventProposal(
+    binding: ProposalBinding,
+    authorMemberId: string,
+    eventType: string,
+    payload: Record<string, unknown>,
+    preview: string,
+    origin: ProposalOrigin,
+    originTurn: number,
+  ): Promise<void> {
+    if (this.#proposalGate.pending) {
+      throw new Error("Cancel or confirm the current proposal before staging another");
+    }
+    const proposal = await stagePendingProposal({
+      binding,
+      authorMemberId,
+      eventType,
+      payload,
+      preview,
+      origin,
+      originTurn,
+    });
+    this.#proposalGate.stage(proposal);
+    this.#orbState = adaptiveOrbReducer(this.#orbState, {
+      type: "enter",
+      mode: "compass",
+      label: "Review & sign",
+    });
+    this.#voiceOutput = `${preview} No event exists yet. Review, then confirm in a separate turn.`;
+    this.#focusAfterRender = "#proposal-title";
+    this.#setStatus("Proposal staged in memory. Circle history is unchanged.");
+    await this.render();
+  }
+
+  async #stageQuestProposal(
+    groupId: string,
+    form: HTMLFormElement | undefined,
+    origin: ProposalOrigin,
+    turn: number,
+  ): Promise<void> {
+    const { group, events, binding } = await this.#proposalState(groupId);
+    const quest = await createQuest(
+      group,
+      events,
+      form ? fieldValue(form, "context") : "unknown",
+      form ? fieldValue(form, "weather") : "unknown",
+    );
+    await this.#stageEventProposal(
+      binding,
+      this.#identityRequired().memberId,
+      "quest.created",
+      { ...questPayload(quest), promptSource: "offline-template" },
+      `Create offline quest “${quest.title}” with ${quest.contextClass}/${quest.weatherBand} context.`,
+      origin,
+      turn,
+    );
+  }
+
+  async #stageOfferingProposal(
+    groupId: string,
+    form: HTMLFormElement | undefined,
+    commandText: string | undefined,
+    origin: ProposalOrigin,
+    turn: number,
+  ): Promise<void> {
+    const { group, events, binding } = await this.#proposalState(groupId);
+    const quest = latestQuest(events);
+    if (!quest) throw new Error("Begin a quest first");
+    const memberId = this.#identityRequired().memberId;
+    if (
+      events.some(
+        (event) =>
+          event.body.type === "quest.offering" &&
+          event.body.payload.questId === quest.questId &&
+          event.body.memberId === memberId,
+      )
+    ) {
+      throw new Error("This companion has already offered to this quest");
+    }
+    const offering = sanitizeOffering(
+      {
         questId: quest.questId,
-        reason: "rest-without-streak-or-penalty",
-      });
-      this.#voiceOutput = "Your lobe rests. The Braid remains open without guilt or score.";
-      this.#voice.speak(this.#voiceOutput);
-      await this.render();
-    } catch (error) {
-      this.#setStatus(this.#error(error));
-    }
+        memberId,
+        text: commandText ?? (form ? fieldValue(form, "text") : ""),
+        choice: commandText
+          ? "carry the spoken thread"
+          : form
+            ? fieldValue(form, "choice")
+            : "",
+        selectedTrait: form ? fieldValue(form, "trait") || undefined : undefined,
+        contextClass:
+          form && (form.elements.namedItem("context") as HTMLInputElement).checked
+            ? quest.contextClass
+            : undefined,
+        approvedForHeirloom: Boolean(
+          form && (form.elements.namedItem("approved") as HTMLInputElement).checked,
+        ),
+      },
+      group,
+    );
+    await this.#stageEventProposal(
+      binding,
+      memberId,
+      "quest.offering",
+      offeringPayload(offering),
+      `Offer “${offering.text}” and leave choice “${offering.choice}”.`,
+      origin,
+      turn,
+    );
   }
 
-  async #demoOffer(groupId: string): Promise<void> {
+  async #stageRestProposal(
+    groupId: string,
+    origin: ProposalOrigin,
+    turn: number,
+  ): Promise<void> {
+    const { events, binding } = await this.#proposalState(groupId);
+    const quest = latestQuest(events);
+    if (!quest) throw new Error("No quest is active");
+    await this.#stageEventProposal(
+      binding,
+      this.#identityRequired().memberId,
+      "quest.rest",
+      { questId: quest.questId, reason: "rest-without-streak-or-penalty" },
+      "Rest this lobe without guilt, score, or streak.",
+      origin,
+      turn,
+    );
+  }
+
+  async #stageDemoOffering(
+    groupId: string,
+    turn: number,
+    approvedForHeirloom: boolean,
+  ): Promise<void> {
     try {
-      const [group, events, demo] = await Promise.all([
-        getCircle(this.#db(), groupId),
-        getCircleEvents(this.#db(), groupId),
+      const [{ group, events, binding }, demo] = await Promise.all([
+        this.#proposalState(groupId),
         getDemoIdentity(this.#db(), groupId),
       ]);
-      if (!group || !demo) throw new Error("No practice companion");
+      if (!group.demo || !demo) throw new Error("No practice companion");
       const quest = latestQuest(events);
       if (!quest) throw new Error("Begin a quest first");
       if (
@@ -1329,135 +2049,450 @@ export class RappHeirApp {
         throw new Error("Morrow already answered this quest");
       }
       const leg = await deriveQuestLeg(quest, demo.memberId, events);
-      await appendDemoEvent(
-        this.#db(),
-        groupId,
-        "quest.offering",
-        offeringPayload({
+      const offering = sanitizeOffering(
+        {
           questId: quest.questId,
           memberId: demo.memberId,
           text: `Morrow noticed the ${leg.influenceMark} thread and folded it into a paper doorway.`,
           choice: `turn toward mark ${leg.influenceMark.slice(0, 4)}`,
           selectedTrait: demo.companion.temperament,
-          approvedForHeirloom: true,
-        }),
+          approvedForHeirloom,
+        },
+        group,
       );
-      this.#setStatus("Simulated offering signed by Morrow’s on-device demo key.");
-      await this.render();
+      await this.#stageEventProposal(
+        binding,
+        demo.memberId,
+        "quest.offering",
+        offeringPayload(offering),
+        `Let simulated Morrow offer “${offering.text}” with its on-device demo key.`,
+        "practice",
+        turn,
+      );
     } catch (error) {
-      this.#setStatus(this.#error(error));
+      this.#setAlert(this.#error(error));
     }
   }
 
-  async #reveal(groupId: string): Promise<void> {
-    try {
-      const events = await getCircleEvents(this.#db(), groupId);
-      const quest = latestQuest(events);
-      if (!quest) throw new Error("No quest is active");
-      const reveal = await deriveSharedReveal(quest, events);
-      await appendLocalEvent(this.#db(), groupId, this.#identityRequired(), "quest.reveal", {
+  async #stageRevealProposal(
+    groupId: string,
+    origin: ProposalOrigin,
+    turn: number,
+  ): Promise<void> {
+    const { events, binding } = await this.#proposalState(groupId);
+    const quest = latestQuest(events);
+    if (!quest) throw new Error("No quest is active");
+    const reveal = await deriveSharedReveal(quest, events);
+    await this.#stageEventProposal(
+      binding,
+      this.#identityRequired().memberId,
+      "quest.reveal",
+      {
         questId: quest.questId,
         text: reveal.text,
         influenceRoot: reveal.influenceRoot,
         memberIds: reveal.memberIds,
         sourceOfferingIds: reveal.sourceOfferingIds,
         approvedForHeirloom: reveal.approvedForHeirloom,
-      });
-      this.#voiceOutput = reveal.text;
-      this.#voice.speak(reveal.text);
-      this.#setStatus(
-        reveal.approvedForHeirloom
-          ? "Shared reveal signed and selected; every included offering was approved."
-          : "Shared reveal signed locally but excluded from the heirloom because an included offering was unapproved.",
-      );
-      await this.render();
-    } catch (error) {
-      this.#setStatus(this.#error(error));
-    }
+      },
+      `Reveal the signed Braid from ${reveal.memberIds.length} distinct member offerings.`,
+      origin,
+      turn,
+    );
   }
 
-  async #runPocketCommand(input: string): Promise<void> {
-    const command = parseCommand(input);
-    const path = routeParts().path;
-    const groupId = path.startsWith("/play/") ? path.slice("/play/".length) : "";
-    if (!groupId) {
-      this.#setStatus("Open a Circle’s Pocket Quest Master to use game commands.");
+  async #sanitizePendingPayload(
+    group: CircleRecord,
+    events: Awaited<ReturnType<typeof getCircleEvents>>,
+    eventType: string,
+    payload: Record<string, unknown>,
+    proposal: PendingProposal,
+  ): Promise<Record<string, unknown>> {
+    const text = (key: string, maximum: number): string => {
+      const value = payload[key];
+      if (typeof value !== "string" || !value.trim() || value.length > maximum) {
+        throw new Error(`Proposal ${key} is invalid`);
+      }
+      return value;
+    };
+    if (eventType === "quest.created") {
+      if (group.status === "forming") throw new Error("Finish first breath before beginning a quest");
+      const memberOrder = Array.isArray(payload.memberOrder) ? payload.memberOrder.map(String) : [];
+      const active = Object.keys(group.members)
+        .filter((memberId) => group.members[memberId]?.active)
+        .sort();
+      if (canonicalStringify(memberOrder) !== canonicalStringify(active)) {
+        throw new Error("Quest member order no longer matches the Circle");
+      }
+      const rawRoles =
+        payload.roles && typeof payload.roles === "object" && !Array.isArray(payload.roles)
+          ? (payload.roles as Record<string, unknown>)
+          : {};
+      const roles = Object.fromEntries(
+        active.map((memberId) => {
+          const role = rawRoles[memberId];
+          if (typeof role !== "string" || !QUEST_ROLES.includes(role as Quest["roles"][string])) {
+            throw new Error("Quest role is invalid");
+          }
+          return [memberId, role];
+        }),
+      ) as Quest["roles"];
+      const contextClass = text("contextClass", 24);
+      const weatherBand = text("weatherBand", 24);
+      if (
+        !["indoors", "doorstep", "park", "street", "transit", "waterside", "unknown"].includes(
+          contextClass,
+        ) ||
+        !["clear", "clouded", "rain", "snow", "wind", "warm", "cold", "unknown"].includes(
+          weatherBand,
+        )
+      ) {
+        throw new Error("Quest context is outside the broad local vocabulary");
+      }
+      const createdAt = text("createdAt", 40);
+      if (!Number.isFinite(Date.parse(createdAt))) throw new Error("Quest time is invalid");
+      const quest: Quest = {
+        questId: text("questId", 80),
+        title: text("title", 120),
+        premise: text("premise", 700),
+        createdAt,
+        contextClass,
+        weatherBand,
+        memberOrder,
+        roles,
+      };
+      if (payload.promptSource !== "offline-template") {
+        throw new Error("Quest source must remain the reviewed offline template");
+      }
+      return { ...questPayload(quest), promptSource: "offline-template" };
+    }
+    if (eventType === "quest.offering") {
+      const offering = sanitizeOffering(
+        {
+          questId: text("questId", 80),
+          memberId: proposal.authorMemberId,
+          text: text("text", 600),
+          choice: text("choice", 48),
+          selectedTrait:
+            typeof payload.selectedTrait === "string" ? payload.selectedTrait : undefined,
+          contextClass:
+            typeof payload.contextClass === "string" ? payload.contextClass : undefined,
+          approvedForHeirloom: payload.approvedForHeirloom === true,
+        },
+        group,
+      );
+      const quest = latestQuest(events);
+      if (!quest || quest.questId !== offering.questId) {
+        throw new Error("Offering no longer targets the current quest");
+      }
+      return offeringPayload(offering);
+    }
+    if (eventType === "quest.rest") {
+      const quest = latestQuest(events);
+      if (!quest || payload.questId !== quest.questId) {
+        throw new Error("Rest no longer targets the current quest");
+      }
+      return {
+        questId: quest.questId,
+        reason: "rest-without-streak-or-penalty",
+      };
+    }
+    if (eventType === "quest.reveal") {
+      const quest = latestQuest(events);
+      if (!quest) throw new Error("No quest is active");
+      const reveal = await deriveSharedReveal(quest, events);
+      return {
+        questId: quest.questId,
+        text: reveal.text,
+        influenceRoot: reveal.influenceRoot,
+        memberIds: reveal.memberIds,
+        sourceOfferingIds: reveal.sourceOfferingIds,
+        approvedForHeirloom: reveal.approvedForHeirloom,
+      };
+    }
+    throw new Error("Unrecognized proposal event type");
+  }
+
+  async #confirmPendingProposal(turn: number): Promise<void> {
+    const pending = this.#proposalGate.pending;
+    if (!pending) {
+      this.#setAlert("There is no pending proposal to confirm.");
       return;
     }
     try {
-      await this.#dispatchCommand(groupId, command);
+      const { group, events, binding } = await this.#proposalState(pending.circleId);
+      const local = this.#identityRequired();
+      const demo = group.demo ? await getDemoIdentity(this.#db(), group.id) : undefined;
+      const confirmed = await this.#proposalGate.confirm({
+        binding,
+        confirmingMemberId: local.memberId,
+        confirmationTurn: turn,
+        authorize: (proposal, confirmingMemberId) =>
+          Boolean(
+            group.members[confirmingMemberId]?.active &&
+              (proposal.authorMemberId === confirmingMemberId ||
+                (group.demo && demo?.memberId === proposal.authorMemberId)),
+          ),
+        sanitize: (eventType, payload, proposal) =>
+          this.#sanitizePendingPayload(group, events, eventType, payload, proposal),
+        sign: async (eventType, payload, proposal) => {
+          const current = await this.#proposalState(group.id);
+          if (
+            current.binding.eventRoot !== proposal.binding.eventRoot ||
+            current.binding.stateDigest !== proposal.binding.stateDigest
+          ) {
+            throw new Error("Circle state changed before signing; review a fresh proposal");
+          }
+          if (proposal.authorMemberId === local.memberId) {
+            await appendLocalEvent(this.#db(), group.id, local, eventType, payload);
+          } else if (group.demo && demo?.memberId === proposal.authorMemberId) {
+            await appendDemoEvent(this.#db(), group.id, eventType, payload);
+          } else {
+            throw new Error("Proposal signer is unavailable");
+          }
+        },
+      });
+      this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "cancel" });
+      this.#voiceOutput = `Signed exactly one ${confirmed.eventType} event. It is ready-not-sent.`;
+      this.#focusAfterRender = "#orb-caption";
+      this.#voice.speak(this.#voiceOutput);
+      this.#setStatus(this.#voiceOutput);
+      await this.render();
     } catch (error) {
-      this.#setStatus(this.#error(error));
+      if (/state changed/iu.test(this.#error(error))) this.#proposalGate.cancel();
+      this.#setAlert(this.#error(error));
+      await this.render();
     }
   }
 
-  async #dispatchCommand(groupId: string, command: PocketCommand): Promise<void> {
-    if (command.type === "create-quest") {
-      await this.#beginQuest(groupId);
-      return;
-    }
-    if (command.type === "turn") {
-      const events = await getCircleEvents(this.#db(), groupId);
-      const quest = latestQuest(events);
-      if (!quest) throw new Error("No quest yet. Say “begin quest.”");
-      const leg = await deriveQuestLeg(quest, this.#identityRequired().memberId, events);
-      this.#voiceOutput = `${leg.role}, ${leg.minutes} minutes. ${leg.prompt}`;
-      this.#voice.speak(this.#voiceOutput);
+  async #startDeviceLogin(): Promise<void> {
+    this.#nextUserTurn();
+    const generation = ++this.#loginUiGeneration;
+    try {
+      const session = await this.#intelligence.startDeviceLogin({
+        onStatus: (status) => this.#setStatus(status),
+      });
+      if (generation !== this.#loginUiGeneration) return;
+      this.#deviceCode = session.device;
       await this.render();
-      return;
+      void session.completion
+        .then(async (result) => {
+          if (generation !== this.#loginUiGeneration) return;
+          this.#deviceCode = undefined;
+          if (result.status === "authenticated") {
+            this.#voiceOutput =
+              "Copilot connected with memory-only tokens. No Circle content was sent during sign-in.";
+            this.#focusAfterRender = "#command-input";
+          }
+          if (routeParts().path.startsWith("/play/")) await this.render();
+        })
+        .catch((error: unknown) => {
+          if (generation !== this.#loginUiGeneration) return;
+          this.#deviceCode = undefined;
+          this.#setAlert(this.#error(error));
+          if (routeParts().path.startsWith("/play/")) void this.render();
+        });
+    } catch (error) {
+      if (generation !== this.#loginUiGeneration) return;
+      this.#deviceCode = undefined;
+      this.#setAlert(this.#error(error));
     }
-    if (command.type === "offer") {
-      if (!command.text) {
-        document.querySelector<HTMLTextAreaElement>('#offering-form textarea[name="text"]')?.focus();
-        this.#voiceOutput = "Type the offering you want to sign; voice text is never auto-committed.";
-        this.#voice.speak(this.#voiceOutput);
-      } else {
-        const form = document.querySelector<HTMLFormElement>("#offering-form");
-        if (!form) throw new Error("No open offering form");
-        await this.#submitOffering(groupId, form, command.text);
-      }
-      return;
+  }
+
+  async #prepareAiPreview(groupId: string, draft: string): Promise<void> {
+    const { group, events } = await this.#proposalState(groupId);
+    const quest = latestQuest(events);
+    const leg = quest
+      ? await deriveQuestLeg(quest, this.#identityRequired().memberId, events)
+      : undefined;
+    const organism = group.genesis ? await deriveOrganismState(group, events) : undefined;
+    this.#aiPreview = buildRemoteContextPreview({
+      draft,
+      quest: quest
+        ? {
+            title: quest.title,
+            premise: quest.premise,
+            contextClass: quest.contextClass,
+            weatherBand: quest.weatherBand,
+            localRole: leg?.role,
+            minutes: leg?.minutes,
+            safeLocalLeg: safeLocalLegForProjection(leg?.prompt),
+          }
+        : undefined,
+      organism: organism
+        ? {
+            aura: organism.aura,
+            motion: organism.motion,
+            hue: organism.hue,
+            rings: organism.rings,
+            structuralMolts: organism.structuralMolts,
+            memberCount: organism.memberCount,
+          }
+        : undefined,
+      circle: {
+        status: group.status,
+        chapter: group.chapter,
+        eventCount: events.length,
+        questCount: events.filter((event) => event.body.type === "quest.created").length,
+        offeringCount: events.filter((event) => event.body.type === "quest.offering").length,
+        revealCount: events.filter((event) => event.body.type === "quest.reveal").length,
+      },
+    });
+    this.#aiDraft = "";
+    this.#aiVoice = "";
+    if (this.#orbState.breadcrumb.at(-1) !== "Mind") {
+      this.#orbState = adaptiveOrbReducer(this.#orbState, {
+        type: "enter",
+        mode: "tunnel",
+        label: "Mind",
+      });
     }
-    if (command.type === "rest") {
-      await this.#rest(groupId);
-      return;
-    }
-    if (command.type === "recap") {
-      const events = await getCircleEvents(this.#db(), groupId);
-      const reveal = events
-        .filter((event) => event.body.type === "quest.reveal")
-        .sort(
-          (left, right) =>
-            left.body.createdAt.localeCompare(right.body.createdAt) || left.id.localeCompare(right.id),
-        )
-        .at(-1);
-      this.#voiceOutput = reveal ? String(reveal.body.payload.text) : "No shared reveal has arrived yet.";
-      this.#voice.speak(this.#voiceOutput);
-      await this.render();
-      return;
-    }
-    if (command.type === "sync") {
-      this.#setStatus("Choose Fresh sync QR; no known peer is silently trusted.");
-      this.#navigate(`/circle/${groupId}`);
-      return;
-    }
-    if (command.type === "prepare-reunion" || command.type === "seal-chapter") {
-      this.#navigate(`/reunion/${groupId}`);
-      return;
-    }
-    if (command.type === "repeat") {
-      this.#voice.repeat();
-      return;
-    }
-    if (command.type === "stop") {
-      this.#voice.stopSpeaking();
-      this.#voice.stopListening();
-      return;
-    }
-    this.#voiceOutput =
-      "Try: begin quest, what is my turn, offer…, pass, recap story, sync, prepare reunion, seal chapter, repeat, or stop.";
-    this.#voice.speak(this.#voiceOutput);
+    this.#focusAfterRender = "#ai-preview-title";
+    this.#setStatus("Exact bounded AI context is ready for explicit approval; nothing was sent.");
     await this.render();
+  }
+
+  async #sendApprovedAiPreview(): Promise<void> {
+    const preview = this.#aiPreview;
+    if (this.#aiStreaming) return;
+    if (!preview || !this.#intelligence.authenticated) {
+      this.#setAlert("Connect Copilot and build a context preview first.");
+      return;
+    }
+    this.#nextUserTurn();
+    const generation = ++this.#aiUiGeneration;
+    this.#aiStreaming = true;
+    document
+      .querySelector<HTMLButtonElement>("#approve-ai-preview")
+      ?.setAttribute("disabled", "");
+    this.#aiDraft = "";
+    this.#aiVoice = "";
+    const output = document.querySelector<HTMLElement>("#ai-draft-output");
+    if (output) output.textContent = "Streaming an untrusted draft…";
+    try {
+      const approved = await approveRemoteContext(preview);
+      const result = await this.#intelligence.chat(approved, (fullText) => {
+        if (generation !== this.#aiUiGeneration) return;
+        const region = document.querySelector<HTMLElement>("#ai-draft-output");
+        if (region) region.textContent = fullText.slice(0, 2_000);
+      });
+      if (generation !== this.#aiUiGeneration) return;
+      this.#aiDraft = result.text;
+      this.#aiVoice = result.voice;
+      this.#aiStreaming = false;
+      this.#aiPreview = undefined;
+      this.#voiceOutput = result.text;
+      this.#setStatus(
+        result.voice
+          ? "Untrusted Copilot display and spoken versions received. Neither entered the command parser or Circle log."
+          : "Untrusted Copilot display received. Spoken version unavailable; nothing was sent to speech.",
+      );
+      await this.render();
+      this.#aiVoicePlayback.speakOnce(
+        generation,
+        this.#aiUiGeneration,
+        result,
+        (voice) => this.#voice.speak(voice),
+      );
+    } catch (error) {
+      if (generation !== this.#aiUiGeneration) return;
+      this.#aiStreaming = false;
+      document
+        .querySelector<HTMLButtonElement>("#approve-ai-preview")
+        ?.removeAttribute("disabled");
+      this.#setAlert(this.#error(error));
+    }
+  }
+
+  async #stageAiOffering(groupId: string, turn: number): Promise<void> {
+    try {
+      if (!this.#aiDraft || this.#aiDraft.length > 600) {
+        throw new Error("Copilot draft must be 1–600 characters to stage as an offering");
+      }
+      const { group, events, binding } = await this.#proposalState(groupId);
+      const quest = latestQuest(events);
+      if (!quest) throw new Error("Begin a quest before staging a Copilot offering");
+      const memberId = this.#identityRequired().memberId;
+      const offering = sanitizeOffering(
+        {
+          questId: quest.questId,
+          memberId,
+          text: this.#aiDraft,
+          choice: "carry the Copilot draft",
+          approvedForHeirloom: false,
+        },
+        group,
+      );
+      await this.#stageEventProposal(
+        binding,
+        memberId,
+        "quest.offering",
+        offeringPayload(offering),
+        `Stage the exact untrusted Copilot draft as an unselected offering: “${offering.text}”.`,
+        "copilot-draft",
+        turn,
+      );
+    } catch (error) {
+      this.#setAlert(this.#error(error));
+    }
+  }
+
+  async #logoutMind(): Promise<void> {
+    this.#loginUiGeneration += 1;
+    this.#aiUiGeneration += 1;
+    this.#intelligence.logout();
+    this.#proposalGate.cancel();
+    this.#voice.stopAll();
+    this.#deviceCode = undefined;
+    this.#aiPreview = undefined;
+    this.#aiDraft = "";
+    this.#aiVoice = "";
+    this.#aiStreaming = false;
+    this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "cancel" });
+    this.#voiceOutput =
+      "Copilot logged out. Tokens, remote chat, proposals, and speech were cleared; local Circle identity remains.";
+    this.#focusAfterRender = "#orb-center";
+    this.#setStatus(this.#voiceOutput);
+    await this.render();
+  }
+
+  async #enableCameraAssist(): Promise<void> {
+    const video = document.querySelector<HTMLVideoElement>("#orb-camera-preview");
+    if (!video) return;
+    try {
+      const { CameraAssist } = await import("./orb-sensor");
+      if (!routeParts().path.startsWith("/play/") || !video.isConnected) return;
+      this.#cameraAssist ??= new CameraAssist();
+      const result = await this.#cameraAssist.enable(video, ({ direction, armed }) => {
+        this.#orbState = adaptiveOrbReducer(this.#orbState, {
+          type: "sensor-highlight",
+          direction,
+        });
+        this.#paintOrbHighlight(
+          armed
+            ? "Camera dwell armed only the highlight; explicit confirmation is still required."
+            : "Camera changed highlight only.",
+        );
+      });
+      video.hidden = !result.enabled;
+      this.#setStatus(
+        result.enabled
+          ? "Camera assist enabled locally. It can highlight only."
+          : result.reason === "unsupported"
+            ? "FaceDetector is unavailable; camera assist is disabled. All other controls still work."
+            : "Camera unavailable; all AI, voice, touch, and keyboard controls still work.",
+      );
+    } catch {
+      video.hidden = true;
+      this.#setStatus("Camera assist could not start. All other controls still work.");
+    }
+  }
+
+  #disableCameraAssist(announce = false): void {
+    this.#cameraAssist?.disable();
+    const video = document.querySelector<HTMLVideoElement>("#orb-camera-preview");
+    if (video) video.hidden = true;
+    if (announce) this.#setStatus("Camera assist disabled and video tracks stopped.");
   }
 
   async #startReunion(groupId: string): Promise<void> {

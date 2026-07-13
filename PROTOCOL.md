@@ -26,6 +26,20 @@ IndexedDB transaction.
 
 Stores in IndexedDB `rapp-heir` version 1 are `identity`, `groups`, `events`, `outbox`, and `settings`.
 
+## Adaptive Orb proposal boundary
+
+`#/play/:circleId` uses pure Orbit/Compass/Tunnel controller state. Input precedence is:
+`stop > cancel > undo > confirm pending > read-only > mutating proposal > petal selection > freeform AI`.
+Assistant output never re-enters this parser. Touch and camera can only highlight; explicit Confirm, voice `confirm`,
+or Enter activates reversible navigation or stages a mutation.
+
+A mutation proposal is memory-only and contains Circle ID, current event root, state digest, originating user turn,
+author member, canonical event type/payload, preview, creation time, and five-minute expiry. Staging never appends.
+A later confirmation reloads the Circle/events, requires a later turn and unchanged root/digest, rechecks enrolled
+authorization, reconstructs a sanitized payload byte-for-byte equal to the frozen canonical payload, and serializes
+one signing call. Cancel/undo, same-turn confirmation, expiry, state change, failed authorization, changed sanitation,
+and duplicate/concurrent confirmation append nothing. Existing signed history remains append-only.
+
 ## Bootstrap invite
 
 An invite is URL-fragment data and therefore is not sent in an HTTP request:
@@ -102,3 +116,30 @@ new challenge. Drafts and failed quorum do not.
 An heirloom hashes a canonical selected-only body containing public genesis/roster, allowed signed events, organism
 state, prior roots, approved offerings/reveals, and the full event root. It excludes all private keys, precise
 location, raw audio, contacts, credentials, and unapproved offering text.
+
+## Optional vBrainstem/Copilot transport
+
+The fixed worker is `https://rapp-auth.kwildfeuer.workers.dev`:
+
+- `POST /api/auth/device` with `{}` starts GitHub device authorization.
+- `POST /api/auth/device/poll` with only `device_code` honors interval, `slow_down`, expiry, and denial.
+- `GET /api/copilot/token` exchanges a memory-only GitHub bearer token.
+- `POST /api/copilot/chat?endpoint=…` is the buffered/SSE fallback when direct GitHub Copilot CORS fails.
+
+Generations plus AbortController reject stale login/chat callbacks. Tokens/endpoints/chat are never persisted.
+Temporary Copilot credentials refresh once on expiry/401. Verification URLs must be HTTPS `github.com/login/device`;
+chat endpoints must be HTTPS on an exact GitHub Copilot allowlist. Requests are `no-store`, and the PWA service worker
+does not intercept or cache them.
+
+Each remote turn requires explicit approval of canonical JSON ≤4 KiB. Its only fields are the current ≤600-character
+draft; bounded quest title/premise/broad context/weather/local role/minutes/safe local leg; coarse three-band aura and
+motion, six-family hue, rings/molts/member count; and generic status/chapter/event counts. Identifiers, names/oath,
+keys/signatures/hashes/roots/times, roster/order, invitation/PIN/PeerJS/Kited data, private keys, audio/location,
+memories/history, unselected offerings/peer text, and heirloom/replica bytes have no projection field. The exact
+preview string is the exact user-message string sent to the recipient chain
+`RAPP auth worker → GitHub Copilot`.
+
+Release chat uses `gpt-4o`, no tools, and at most a concise narrator/planner draft. SSE parsing supports fragmented
+UTF-8, CRLF, multiline `data`, and `[DONE]`; JSON/plain buffered responses are accepted from the fallback. Copilot
+cannot append, sign, store, sync, seal, or approve an heirloom. A user may separately stage a bounded draft as an
+unchecked offering proposal and later review/sign it through the normal gate.

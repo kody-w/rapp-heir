@@ -1,5 +1,13 @@
-const VERSION = "rapp-heir-shell-v1";
+const VERSION = "rapp-heir-shell-v2";
 const BASE = "/rapp-heir/";
+const AUTH_ORIGIN = "https://rapp-auth.kwildfeuer.workers.dev";
+const COPILOT_HOSTS = new Set([
+  "api.githubcopilot.com",
+  "api.individual.githubcopilot.com",
+  "api.business.githubcopilot.com",
+  "api.enterprise.githubcopilot.com",
+  "copilot-proxy.githubusercontent.com"
+]);
 const SHELL = [
   BASE,
   `${BASE}manifest.webmanifest`,
@@ -51,6 +59,9 @@ self.addEventListener("fetch", (event) => {
   const request = event.request;
   if (request.method !== "GET") return;
   const url = new URL(request.url);
+  if (url.origin === AUTH_ORIGIN || COPILOT_HOSTS.has(url.hostname)) {
+    return;
+  }
   if (url.origin !== self.location.origin || !url.pathname.startsWith(BASE)) return;
 
   if (request.mode === "navigate") {

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { canonicalStringify, sha256 } from "../src/canonical";
 import { importVerifiedHeirloom, mintHeirloom, verifyHeirloom } from "../src/heirloom";
+import {
+  parseIntelligenceResult,
+  VOICE_RESPONSE_MARKER,
+} from "../src/intelligence";
 import { deriveOrganismState } from "../src/organism";
 import { deriveSharedReveal, questFromEvent } from "../src/quest";
 import {
@@ -27,6 +31,7 @@ import type {
 import { clone, groupFor, identity, signedEvent, uniqueDatabaseName } from "./helpers";
 
 const NOW = 1_750_000_000_000;
+const AI_VOICE_CANARY = "HEIRLOOM-VOICE-TAIL-CANARY-833a";
 const databases: ReplicaDatabase[] = [];
 
 afterEach(async () => {
@@ -200,9 +205,12 @@ describe("reunion quorum and heirloom", () => {
       memberOrder: [a.memberId, b.memberId],
       roles: { [a.memberId]: "Scout", [b.memberId]: "Dreamer" },
     });
+    const aiOffering = parseIntelligenceResult(
+      `Keep this selected lantern.${VOICE_RESPONSE_MARKER}${AI_VOICE_CANARY}`,
+    );
     const approved = await signedEvent(group, a, "quest.offering", {
       questId,
-      text: "Keep this selected lantern.",
+      text: aiOffering.text,
       choice: "turn left",
       selectedTrait: null,
       contextClass: null,
@@ -241,6 +249,7 @@ describe("reunion quorum and heirloom", () => {
     expect(canonicalStringify(artifact)).toContain("Keep this selected lantern.");
     expect(canonicalStringify(artifact)).not.toContain("Private unselected wording.");
     expect(canonicalStringify(artifact)).not.toContain("turn right");
+    expect(canonicalStringify(artifact)).not.toContain(AI_VOICE_CANARY);
     expect(canonicalStringify(artifact)).not.toMatch(/privateJwk|rawAudio|latitude|longitude/u);
   });
 

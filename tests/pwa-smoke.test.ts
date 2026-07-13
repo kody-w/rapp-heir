@@ -47,6 +47,9 @@ describe("PWA and repository smoke checks", () => {
     expect(text("src/main.ts")).toContain("serviceWorker.register");
     expect(text("public/sw.js")).toContain('const BASE = "/rapp-heir/"');
     expect(text("public/sw.js")).toContain('key.startsWith("rapp-heir-")');
+    expect(text("public/sw.js")).toContain("rapp-heir-shell-v2");
+    expect(text("public/sw.js")).toContain("rapp-auth.kwildfeuer.workers.dev");
+    expect(text("public/sw.js")).toContain("api.githubcopilot.com");
   });
 
   it("keeps accessibility focus, safe areas, and push-to-talk release behavior explicit", () => {
@@ -64,6 +67,27 @@ describe("PWA and repository smoke checks", () => {
     expect(styles).toContain("env(safe-area-inset-right)");
     expect(styles).toContain("env(safe-area-inset-bottom)");
     expect(styles).toContain("linear-gradient(135deg, #765fd8, #4e3cad)");
+  });
+
+  it("keeps Adaptive Orb display, speech, and AI authority channels separate", () => {
+    const app = text("src/app.ts");
+    const stageStart = app.indexOf("async #stageAiOffering");
+    const stageEnd = app.indexOf("async #logoutMind", stageStart);
+    const stage = app.slice(stageStart, stageEnd);
+    expect(app).toContain("this.#aiDraft = result.text;");
+    expect(app).toContain("this.#aiVoice = result.voice;");
+    expect(app).toContain("this.#voiceOutput = result.text;");
+    expect(app).toContain("(voice) => this.#voice.speak(voice)");
+    expect(app).not.toContain("this.#voice.speak(result.text)");
+    expect(app).toContain("<summary>Spoken version</summary>");
+    expect(app).toContain("Spoken version unavailable");
+    expect(stage).toContain("text: this.#aiDraft");
+    expect(stage).not.toContain("#aiVoice");
+    const downstream = ["src/peer.ts", "src/storage.ts", "src/heirloom.ts"]
+      .map(text)
+      .join("\n");
+    expect(downstream).not.toContain("VOICE_RESPONSE_MARKER");
+    expect(downstream).not.toContain("aiVoice");
   });
 
   it("uses explicit signaling with no TURN credential and keeps practice on-device", () => {

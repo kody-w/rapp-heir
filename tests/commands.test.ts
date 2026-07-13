@@ -76,4 +76,63 @@ describe("Pocket Quest Master command grammar", () => {
       voice.stopListening();
       expect(stop).toHaveBeenCalledOnce();
   });
+
+  it("interrupts speech and ignores recognition callbacks after explicit stop cleanup", () => {
+    const transcript = vi.fn();
+    const cancel = vi.fn();
+    const abort = vi.fn();
+    let instance:
+      | {
+          onresult: ((event: unknown) => void) | null;
+        }
+      | undefined;
+    class Recognition {
+      continuous = false;
+      interimResults = false;
+      lang = "";
+      processLocally = false;
+      onresult: ((event: unknown) => void) | null = null;
+      onerror = null;
+      onend = null;
+      start = vi.fn();
+      stop = vi.fn();
+      abort = abort;
+      constructor() {
+        instance = this;
+      }
+    }
+    vi.stubGlobal("window", {
+      SpeechRecognition: Recognition,
+      speechSynthesis: { cancel, speak: vi.fn() },
+    });
+    vi.stubGlobal("navigator", { language: "en-US" });
+    const voice = new VoicePocketGM(transcript, vi.fn());
+    voice.startPushToTalk();
+    expect(cancel).toHaveBeenCalled();
+    voice.stopAll();
+    instance?.onresult?.({
+      results: [{ isFinal: true, 0: { transcript: "confirm" } }],
+    });
+    expect(abort).toHaveBeenCalledOnce();
+    expect(transcript).not.toHaveBeenCalled();
+  });
+
+  it("clears the repeat buffer on stop so stale AI speech cannot restart", () => {
+    const cancel = vi.fn();
+    const speak = vi.fn();
+    class Utterance {
+      constructor(readonly text: string) {}
+    }
+    vi.stubGlobal("window", {
+      speechSynthesis: { cancel, speak },
+    });
+    vi.stubGlobal("SpeechSynthesisUtterance", Utterance);
+    const voice = new VoicePocketGM(vi.fn(), vi.fn());
+    voice.speak("Current spoken version.");
+    voice.stopAll();
+    voice.repeat();
+    expect(speak).toHaveBeenCalledOnce();
+    expect(speak.mock.calls[0]?.[0]).toMatchObject({ text: "Current spoken version." });
+    expect(cancel).toHaveBeenCalledTimes(2);
+  });
 });

@@ -31,6 +31,19 @@ QR/PIN was not relayed. The ceremony is a social check with a six-digit security
 - Exact GPS, contacts, raw audio, raw device/twin IDs, credentials, and API keys have no wire fields. Quest context is
   a broad user-selected class and weather band.
 - Heirloom export includes only explicitly selected offering/reveal text and applies a forbidden-field scan.
+- Adaptive Orb highlights are inert. Quest/offering/rest/reveal and AI-derived actions become memory-only proposals
+  bound to Circle ID, event root, state digest, author turn, exact canonical payload, and expiry. Only a later exact
+  confirmation reloads and validates that binding, sanitizes unchanged bytes, checks authorization, and signs once.
+  Same-turn, stale, expired, unauthorized, changed, cancelled, undone, and duplicate confirmations create no event.
+- Copilot receives a schema-built, user-previewed ≤4 KiB projection only. Endpoint hosts and GitHub verification URLs
+  are HTTPS allowlisted. Assistant text/tool-like JSON never enters the command parser, and the intelligence service
+  has no signing, storage, sync, PeerJS, reunion, seal, key, event, or heirloom capability.
+- Copilot responses are untrusted bounded data. The parser splits once on `|||VOICE|||`; streaming withholds the
+  marker, partial marker suffixes, and all later voice bytes from the display. Only display text can enter memory
+  history or a separately reviewed proposal. Only the bounded voice field can reach speech synthesis or its optional
+  caption, and a missing/malformed marker disables speech. Voice text has no event, replica, PeerJS, or heirloom path.
+  A generation gate permits at most one completed current turn to speak; stop aborts the stream, cancels speech, and
+  makes late completion stale.
 
 ## Platform and operational risks
 
@@ -43,6 +56,18 @@ Browser compromise, malicious extensions, same-origin XSS, physical access to an
 or IndexedDB deletion can expose or destroy local keys. This MVP has no passcode wrapping, hardware-bound key,
 revocation, account recovery, key rotation, or multi-device identity migration. Export replica packs regularly; they
 do not recover the private signing identity.
+
+Optional Copilot adds the RAPP Cloudflare auth worker and GitHub Copilot as network trust boundaries. Tokens remain
+memory-only, requests are `no-store`, logout aborts and clears auth/chat/proposals/speech, and the service worker
+bypasses these origins. This does not prevent a compromised browser/extension from reading process memory. Copilot
+output is untrusted prose, not proof or authority. Direct CORS, account entitlement, token exchange, and worker
+availability can fail; offline templates remain available.
+
+Browser/platform speech recognition may send audio to its provider despite the requested local-processing hint.
+Push-to-talk is never ambient and raw audio is not retained by the app. Optional camera assist uses video-only
+FaceDetector, keeps no image/biometric record, can only highlight, and never confirms an action.
+Browser/platform speech synthesis may use installed or provider-backed voices; only the bounded spoken field is
+submitted, never the formatted display answer.
 
 The host coordinates a temporary transport and is not the Circle owner. A malicious enrolled member can fork its own
 sequence, submit untruthful inert text, withhold events, or refuse quorum. It cannot forge another enrolled signature

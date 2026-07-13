@@ -2,6 +2,23 @@
 
 Rapp Heir includes original interface copy, Canvas artwork, and quest material created for this repository.
 
+Adaptive Orb interaction/state/lifecycle principles were adapted from:
+
+- source repository path: `moonshots/003-impossible-interface-tournament`
+- supplied source checkout: `/tmp/rapp-moonshots-interface/moonshots/003-impossible-interface-tournament`
+- commit: `d00cca8f04e11530bfb2294b9ad7a4bc2596a8f1`
+- license: MIT
+
+Rapp Heir adapts the Orbit/Compass/Tunnel, center/cancel, explicit-confirmation, and multimodal-highlight principles.
+It does not copy the finalist HTML/CSS or tournament task logic wholesale.
+
+The AI display/text-to-speech response split was adapted from the RAPP Installer brainstem contract:
+
+- repository: `kody-w/rapp-installer`
+- commit: `5fbde1776a72715935c3d597a9ddfce28a04032b`
+- path: `rapp_brainstem/brainstem.py` (voice prompt and split-once handling around lines 2292–2295 and 2352–2355)
+- marker: `|||VOICE|||`
+
 Runtime dependencies are distributed under their respective licenses:
 
 - PeerJS (`peerjs`) — MIT
