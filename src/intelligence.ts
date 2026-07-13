@@ -9,6 +9,9 @@ export const MAX_AI_TEXT_CHARACTERS = 2_000;
 export const MAX_AI_TEXT_BYTES = 6_000;
 export const MAX_AI_VOICE_CHARACTERS = 600;
 export const MAX_AI_VOICE_BYTES = 1_200;
+const MALFORMED_PROTOCOL_SENTINEL = "|||RAPP_PROTOCOL_MALFORMED|||";
+const MALFORMED_PROTOCOL_DISPLAY =
+  "The remote response used malformed protocol data. It was not spoken or staged.";
 
 const DEVICE_START_PATH = "/api/auth/device";
 const DEVICE_POLL_PATH = "/api/auth/device/poll";
@@ -133,26 +136,64 @@ function withoutPartialVoiceMarker(value: string): string {
   return value;
 }
 
+function markerCount(value: string): number {
+  return value.split(VOICE_RESPONSE_MARKER).length - 1;
+}
+
+function protocolLooking(value: string): boolean {
+  const trimmed = value.trimStart();
+  return (
+    /^(?:data\s*:|event\s*:|id\s*:|retry\s*:)/iu.test(trimmed) ||
+    /^[\[{]/u.test(trimmed)
+  );
+}
+
+function displayPrefix(value: string): string {
+  const malformedIndex = value.indexOf(MALFORMED_PROTOCOL_SENTINEL);
+  const markerIndex = value.indexOf(VOICE_RESPONSE_MARKER);
+  const protocolDelimiter = value.indexOf("|||");
+  const indexes = [malformedIndex, markerIndex, protocolDelimiter].filter(
+    (index) => index >= 0,
+  );
+  const end = indexes.length > 0 ? Math.min(...indexes) : value.length;
+  return withoutPartialVoiceMarker(value.slice(0, end));
+}
+
 export function displayTextFromVoiceStream(value: unknown): string {
   if (typeof value !== "string") return "";
-  const markerIndex = value.indexOf(VOICE_RESPONSE_MARKER);
-  const display =
-    markerIndex >= 0
-      ? value.slice(0, markerIndex)
-      : withoutPartialVoiceMarker(value);
-  return boundedText(display, MAX_AI_TEXT_CHARACTERS, MAX_AI_TEXT_BYTES);
+  return boundedText(displayPrefix(value), MAX_AI_TEXT_CHARACTERS, MAX_AI_TEXT_BYTES);
 }
 
 export function parseIntelligenceResult(value: unknown): IntelligenceResult {
   if (typeof value !== "string") return { text: "", voice: "" };
+  if (value.includes(MALFORMED_PROTOCOL_SENTINEL)) {
+    return {
+      text:
+        boundedText(displayPrefix(value), MAX_AI_TEXT_CHARACTERS, MAX_AI_TEXT_BYTES) ||
+        MALFORMED_PROTOCOL_DISPLAY,
+      voice: "",
+    };
+  }
+  const count = markerCount(value);
   const markerIndex = value.indexOf(VOICE_RESPONSE_MARKER);
-  if (markerIndex < 0) {
+  if (count !== 1 || markerIndex < 0) {
     return {
       text: boundedText(
-        withoutPartialVoiceMarker(value),
+        displayPrefix(value),
         MAX_AI_TEXT_CHARACTERS,
         MAX_AI_TEXT_BYTES,
       ),
+      voice: "",
+    };
+  }
+  const tail = value.slice(markerIndex + VOICE_RESPONSE_MARKER.length);
+  if (
+    tail.includes("|||") ||
+    protocolLooking(value.slice(0, markerIndex)) ||
+    protocolLooking(tail)
+  ) {
+    return {
+      text: boundedText(value.slice(0, markerIndex), MAX_AI_TEXT_CHARACTERS, MAX_AI_TEXT_BYTES),
       voice: "",
     };
   }
@@ -163,7 +204,7 @@ export function parseIntelligenceResult(value: unknown): IntelligenceResult {
       MAX_AI_TEXT_BYTES,
     ),
     voice: boundedText(
-      value.slice(markerIndex + VOICE_RESPONSE_MARKER.length),
+      tail,
       MAX_AI_VOICE_CHARACTERS,
       MAX_AI_VOICE_BYTES,
     ).replace(/\s+/gu, " "),
@@ -416,10 +457,6 @@ function noStoreInit(init: RequestInit = {}): RequestInit {
     cache: "no-store",
     credentials: "omit",
     referrerPolicy: "no-referrer",
-    headers: {
-      "Cache-Control": "no-store",
-      ...(init.headers ?? {}),
-    },
   };
 }
 
@@ -460,6 +497,12 @@ export interface IntelligenceOptions {
   workerUrl?: string;
   now?: () => number;
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+}
+
+interface CopilotCredentials {
+  token: string;
+  endpoint: string;
+  expiresAt: number;
 }
 
 function defaultSleep(milliseconds: number, signal: AbortSignal): Promise<void> {
@@ -576,7 +619,11 @@ export async function parseSseStream(
     try {
       addition = extractSseContent(JSON.parse(data));
     } catch {
-      addition = data;
+      if (!full.includes(MALFORMED_PROTOCOL_SENTINEL)) {
+        full += MALFORMED_PROTOCOL_SENTINEL;
+        onDelta?.(displayTextFromVoiceStream(full));
+      }
+      return;
     }
     if (addition) {
       full += addition;
@@ -615,9 +662,10 @@ export function parseBufferedChatResponse(text: string): string {
   const trimmed = text.trim();
   if (!trimmed) return "";
   try {
-    return extractSseContent(JSON.parse(trimmed)).trim();
+    const content = extractSseContent(JSON.parse(trimmed)).trim();
+    return content || MALFORMED_PROTOCOL_SENTINEL;
   } catch {
-    return trimmed;
+    return protocolLooking(trimmed) ? MALFORMED_PROTOCOL_SENTINEL : trimmed;
   }
 }
 
@@ -687,14 +735,24 @@ export class IntelligenceService {
     return this.#chatHistory.map((item) => ({ ...item }));
   }
 
+  #clearAuthentication(): void {
+    this.#githubToken = undefined;
+    this.#copilotToken = undefined;
+    this.#copilotEndpoint = undefined;
+    this.#copilotExpiresAt = 0;
+  }
+
   cancelDeviceLogin(): void {
+    const pending = Boolean(this.#loginAbort);
     this.#loginGeneration += 1;
     this.#loginAbort?.abort();
     this.#loginAbort = undefined;
+    if (pending) this.#clearAuthentication();
   }
 
   async startDeviceLogin(callbacks: DeviceLoginCallbacks = {}): Promise<DeviceLoginSession> {
     this.cancelDeviceLogin();
+    this.#clearAuthentication();
     const generation = ++this.#loginGeneration;
     const controller = new AbortController();
     this.#loginAbort = controller;
@@ -743,6 +801,8 @@ export class IntelligenceService {
       };
     } catch (error) {
       if (!active()) throw abortError();
+      this.#clearAuthentication();
+      this.#loginAbort = undefined;
       throw safeRemoteError(error);
     }
   }
@@ -763,6 +823,8 @@ export class IntelligenceService {
         await this.#sleep(interval * 1_000, controller.signal);
         if (!active()) return { status: "cancelled" };
         if (this.#now() >= device.expiresAt) {
+          this.#clearAuthentication();
+          this.#loginAbort = undefined;
           callbacks.onStatus?.("The GitHub device code expired. Nothing was stored.");
           return { status: "expired" };
         }
@@ -775,14 +837,25 @@ export class IntelligenceService {
             signal: controller.signal,
           }),
         );
+        if (!response.ok) throw new Error("GitHub authorization polling failed");
         const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
         if (!active()) return { status: "cancelled" };
         if (typeof data.access_token === "string" && data.access_token.length >= 8) {
           const accessToken = data.access_token;
           callbacks.onStatus?.("GitHub authorized. Connecting Copilot…");
+          const credentials = await this.#exchangeCopilotToken(
+            accessToken,
+            controller.signal,
+            generation,
+          );
+          if (!active()) {
+            this.#clearAuthentication();
+            return { status: "cancelled" };
+          }
           this.#githubToken = accessToken;
-          await this.#exchangeCopilotToken(controller.signal, generation);
-          if (!active()) return { status: "cancelled" };
+          this.#copilotToken = credentials.token;
+          this.#copilotEndpoint = credentials.endpoint;
+          this.#copilotExpiresAt = credentials.expiresAt;
           this.#loginAbort = undefined;
           callbacks.onStatus?.("Copilot connected. Tokens remain only in memory.");
           return { status: "authenticated" };
@@ -792,28 +865,36 @@ export class IntelligenceService {
           interval = Math.min(interval + 5, 60);
           callbacks.onStatus?.("GitHub asked polling to slow down; still waiting.");
         } else if (error === "access_denied") {
+          this.#clearAuthentication();
+          this.#loginAbort = undefined;
           callbacks.onStatus?.("GitHub authorization was denied. Nothing was stored.");
           return { status: "denied" };
         } else if (error === "expired_token") {
+          this.#clearAuthentication();
+          this.#loginAbort = undefined;
           callbacks.onStatus?.("The GitHub device code expired. Nothing was stored.");
           return { status: "expired" };
         } else {
           callbacks.onStatus?.("Waiting for GitHub authorization…");
         }
       }
+      this.#clearAuthentication();
+      this.#loginAbort = undefined;
       callbacks.onStatus?.("The GitHub device code expired. Nothing was stored.");
       return { status: "expired" };
     } catch (error) {
+      this.#clearAuthentication();
+      if (generation === this.#loginGeneration) this.#loginAbort = undefined;
       if (isAbort(error) || !active()) return { status: "cancelled" };
-      this.#githubToken = undefined;
-      this.#copilotToken = undefined;
-      this.#copilotEndpoint = undefined;
       throw safeRemoteError(error);
     }
   }
 
-  async #exchangeCopilotToken(signal: AbortSignal, loginGeneration?: number): Promise<void> {
-    const githubToken = this.#githubToken;
+  async #exchangeCopilotToken(
+    githubToken: string,
+    signal: AbortSignal,
+    loginGeneration?: number,
+  ): Promise<CopilotCredentials> {
     if (!githubToken) throw new Error("Sign in to GitHub first");
     const response = await this.#fetch(
       `${this.#workerUrl}${COPILOT_TOKEN_PATH}`,
@@ -849,9 +930,11 @@ export class IntelligenceService {
       typeof data.expires_at === "number" && Number.isFinite(data.expires_at)
         ? data.expires_at
         : Math.floor(this.#now() / 1_000) + 1_500;
-    this.#copilotToken = data.token;
-    this.#copilotEndpoint = endpoint;
-    this.#copilotExpiresAt = expiresAtSeconds * 1_000;
+    return {
+      token: data.token,
+      endpoint,
+      expiresAt: expiresAtSeconds * 1_000,
+    };
   }
 
   async #ensureCopilotToken(signal: AbortSignal, force = false): Promise<void> {
@@ -861,7 +944,13 @@ export class IntelligenceService {
       !this.#copilotEndpoint ||
       this.#now() >= this.#copilotExpiresAt - 60_000
     ) {
-      await this.#exchangeCopilotToken(signal);
+      const githubToken = this.#githubToken;
+      if (!githubToken) throw new Error("Sign in to GitHub first");
+      const credentials = await this.#exchangeCopilotToken(githubToken, signal);
+      if (signal.aborted) throw abortError();
+      this.#copilotToken = credentials.token;
+      this.#copilotEndpoint = credentials.endpoint;
+      this.#copilotExpiresAt = credentials.expiresAt;
     }
   }
 
@@ -879,15 +968,13 @@ export class IntelligenceService {
   logout(): void {
     this.cancelDeviceLogin();
     this.clearChat();
-    this.#githubToken = undefined;
-    this.#copilotToken = undefined;
-    this.#copilotEndpoint = undefined;
-    this.#copilotExpiresAt = 0;
+    this.#clearAuthentication();
   }
 
   async chat(
     approved: ApprovedRemoteContext,
     onDelta?: (fullText: string) => void,
+    onRequestSent?: () => void,
   ): Promise<IntelligenceResult> {
     this.abortChat();
     const generation = ++this.#chatGeneration;
@@ -916,24 +1003,29 @@ export class IntelligenceService {
       let response: Response;
       let usedProxy = false;
       try {
+        onRequestSent?.();
         response = await this.#directChat(requestBody, controller.signal);
       } catch (error) {
         if (isAbort(error)) throw error;
         if (!(error instanceof TypeError)) throw error;
         usedProxy = true;
+        onRequestSent?.();
         response = await this.#proxyChat(requestBody, controller.signal);
       }
       if (response.status === 401) {
         await this.#ensureCopilotToken(controller.signal, true);
         if (usedProxy) {
+          onRequestSent?.();
           response = await this.#proxyChat(requestBody, controller.signal);
         } else {
           try {
+            onRequestSent?.();
             response = await this.#directChat(requestBody, controller.signal);
           } catch (error) {
             if (isAbort(error)) throw error;
             if (!(error instanceof TypeError)) throw error;
             usedProxy = true;
+            onRequestSent?.();
             response = await this.#proxyChat(requestBody, controller.signal);
           }
         }

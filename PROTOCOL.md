@@ -37,8 +37,44 @@ A mutation proposal is memory-only and contains Circle ID, current event root, s
 author member, canonical event type/payload, preview, creation time, and five-minute expiry. Staging never appends.
 A later confirmation reloads the Circle/events, requires a later turn and unchanged root/digest, rechecks enrolled
 authorization, reconstructs a sanitized payload byte-for-byte equal to the frozen canonical payload, and serializes
-one signing call. Cancel/undo, same-turn confirmation, expiry, state change, failed authorization, changed sanitation,
-and duplicate/concurrent confirmation append nothing. Existing signed history remains append-only.
+one signing call. Authorization/sanitation await points and the instant before commit recheck expiry and cancellation.
+Once commit starts, UI reports non-cancelable signing rather than promising zero events. Every Circle mutation is
+serialized by one per-Circle Web Lock where available plus an in-process queue fallback. Proposal append passes the
+expected root into the IndexedDB transaction; the transaction rechecks that root before adding the event. Cancel/undo
+before commit, same-turn confirmation, expiry, state change, failed authorization, changed sanitation, and
+duplicate/concurrent confirmation append nothing. A successful commit consumes the proposal even if later UI work
+fails. Existing signed history remains append-only.
+
+## Verified built-in Python cell
+
+`agent-cell.html` is loaded on demand only as an opaque-origin iframe with `sandbox="allow-scripts"`. It accepts one
+initial transferred private `MessagePort`, ignores ordinary window messages afterward, and owns a blob Web Worker so
+Python cannot block the host UI thread. The cell exposes one request shape:
+
+```text
+run-agent(requestId, allowlisted built-in agent name, bounded JSON args)
+```
+
+There is no arbitrary source, URL, eval, host callback, storage, DOM, signing, PeerJS, or network-capability API. The
+worker pins Pyodide 0.26.4 and fetches only:
+
+```text
+https://raw.githubusercontent.com/kody-w/rapp-heir/
+dd583a19c86414f98ae6c2c6d482f409c55679a4/public/agents/manifest.json
+```
+
+The exact manifest SHA-256 is
+`ac249a9ddfddc9661d3f9093dc3b5149cb947bbba1556312d94f0fcd283bdc98`. Manifest redirects, URL drift, non-200 status,
+wrong MIME/schema/hash, paths other than the fixed simple `*_agent.py` children, and responses over 16 KiB fail.
+Selected source is limited to 64 KiB and must match its full manifest SHA-256 before compile/exec in a fresh namespace.
+Only `AGENT.perform(**args)` is called. Args are at most 16 KiB and the typed
+`{agent, manifestHash, sourceHash, output, metadata}` result is at most 32 KiB.
+
+The host uses lifecycle generations, private request IDs, boot/run deadlines, AbortSignal, and stale-response
+rejection. Timeout/abort/route cleanup tears down the host iframe; timeout/cancel/failure terminates and replaces the
+cell worker. QuestMaster output is strictly parsed and may optionally be checked by QuestSafety, then becomes only a
+normal memory PendingProposal. Peer/Kited-Twin code is never accepted. First run needs pinned raw GitHub and Pyodide
+network access; browser cache is best-effort and the deterministic JavaScript quest fallback remains authoritative.
 
 ## Bootstrap invite
 
@@ -126,10 +162,14 @@ The fixed worker is `https://rapp-auth.kwildfeuer.workers.dev`:
 - `GET /api/copilot/token` exchanges a memory-only GitHub bearer token.
 - `POST /api/copilot/chat?endpoint=…` is the buffered/SSE fallback when direct GitHub Copilot CORS fails.
 
-Generations plus AbortController reject stale login/chat callbacks. Tokens/endpoints/chat are never persisted.
+Generations plus AbortController reject stale login/chat callbacks. A GitHub token remains staged locally until its
+Copilot exchange succeeds while the same login generation is active; cancel/denial/expiry/error clears staged and
+auth values. Tokens/endpoints/chat are never persisted.
 Temporary Copilot credentials refresh once on expiry/401. Verification URLs must be HTTPS `github.com/login/device`;
 chat endpoints must be HTTPS on an exact GitHub Copilot allowlist. Requests are `no-store`, and the PWA service worker
-does not intercept or cache them.
+does not intercept or cache them. `Cache-Control` is not added as a request header.
+The client retains `cache: "no-store"`, omitted credentials, and no-referrer; response-cache policy at the remote
+authentication worker is outside this repository and must be configured by that operator.
 
 Each remote turn requires explicit approval of canonical JSON ≤4 KiB. Its only fields are the current ≤600-character
 draft; bounded quest title/premise/broad context/weather/local role/minutes/safe local leg; coarse three-band aura and
@@ -140,6 +180,8 @@ preview string is the exact user-message string sent to the recipient chain
 `RAPP auth worker → GitHub Copilot`.
 
 Release chat uses `gpt-4o`, no tools, and at most a concise narrator/planner draft. SSE parsing supports fragmented
-UTF-8, CRLF, multiline `data`, and `[DONE]`; JSON/plain buffered responses are accepted from the fallback. Copilot
+UTF-8, CRLF, multiline `data`, and `[DONE]`; JSON/plain buffered responses are accepted from the fallback. Exactly one
+voice marker is required for speech. Malformed/multiple markers and protocol-looking malformed SSE/JSON are bounded
+for display without raw protocol-to-speech fallback. Copilot
 cannot append, sign, store, sync, seal, or approve an heirloom. A user may separately stage a bounded draft as an
 unchecked offering proposal and later review/sign it through the normal gate.

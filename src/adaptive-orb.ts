@@ -202,7 +202,17 @@ export function shouldIgnoreOrbShortcut(target: EventTarget | null): boolean {
   if (typeof Element === "undefined" || !(target instanceof Element)) return false;
   return Boolean(
     target.closest(
-      'input, textarea, select, option, form, [contenteditable="true"], button',
+      'a, button, input, textarea, select, option, form, summary, h1, h2, h3, h4, h5, h6, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"]',
     ),
+  );
+}
+
+export function orbShortcutSurfaceOwnsFocus(target: EventTarget | null): boolean {
+  if (typeof document === "undefined") return false;
+  if (target === document.body || target === document.documentElement) return true;
+  return (
+    typeof Element !== "undefined" &&
+    target instanceof Element &&
+    target.matches("[data-orb-shortcut-surface]")
   );
 }

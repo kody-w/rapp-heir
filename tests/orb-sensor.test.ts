@@ -97,4 +97,38 @@ describe("optional FaceDetector camera assist", () => {
     await expect(enabling).resolves.toMatchObject({ enabled: false });
     expect(stop).toHaveBeenCalledOnce();
   });
+
+  it("a stale first enable cannot stop or hide a newer captured stream", async () => {
+    const first = fakeStream();
+    const second = fakeStream();
+    let mediaCall = 0;
+    let finishFirstPlay!: () => void;
+    const firstVideo = fakeVideo();
+    firstVideo.play = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishFirstPlay = resolve;
+        }),
+    );
+    const secondVideo = fakeVideo();
+    const assist = new CameraAssist({
+      mediaDevices: {
+        getUserMedia: vi.fn(async () => (mediaCall++ === 0 ? first.stream : second.stream)),
+      },
+      createFaceDetector: () => ({ detect: vi.fn(async () => []) }),
+      schedule: vi.fn(() => 1),
+      cancelSchedule: vi.fn(),
+    });
+    const firstEnable = assist.enable(firstVideo, vi.fn());
+    await vi.waitFor(() => expect(firstVideo.srcObject).toBe(first.stream));
+    const secondEnable = assist.enable(secondVideo, vi.fn());
+    await expect(secondEnable).resolves.toEqual({ enabled: true });
+    finishFirstPlay();
+    await expect(firstEnable).resolves.toMatchObject({ enabled: false });
+    expect(assist.enabled).toBe(true);
+    expect(secondVideo.srcObject).toBe(second.stream);
+    expect(second.stop).not.toHaveBeenCalled();
+    assist.disable();
+    expect(second.stop).toHaveBeenCalledOnce();
+  });
 });

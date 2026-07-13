@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { describe, expect, it } from "vitest";
+import { runInNewContext } from "node:vm";
+import { describe, expect, it, vi } from "vitest";
 
 const root = process.cwd();
 
@@ -29,7 +30,7 @@ describe("PWA and repository smoke checks", () => {
       qrcode: "1.5.4",
       "@zxing/browser": "0.1.5",
     });
-    expect(text("vite.config.ts")).toContain('base: "/rapp-heir/"');
+    expect(text("vite.config.ts")).toContain('const base = "/rapp-heir/"');
   });
 
   it("ships a scoped manifest, custom service worker, and Apple touch metadata", () => {
@@ -47,9 +48,13 @@ describe("PWA and repository smoke checks", () => {
     expect(text("src/main.ts")).toContain("serviceWorker.register");
     expect(text("public/sw.js")).toContain('const BASE = "/rapp-heir/"');
     expect(text("public/sw.js")).toContain('key.startsWith("rapp-heir-")');
-    expect(text("public/sw.js")).toContain("rapp-heir-shell-v2");
+    expect(text("public/sw.js")).toContain("rapp-heir-shell-v3");
     expect(text("public/sw.js")).toContain("rapp-auth.kwildfeuer.workers.dev");
     expect(text("public/sw.js")).toContain("api.githubcopilot.com");
+    expect(text("public/sw.js")).toContain("raw.githubusercontent.com");
+    expect(text("public/sw.js")).toContain("cdn.jsdelivr.net");
+    expect(text("public/sw.js")).toContain("agent-cell.html");
+    expect(text("public/sw.js")).toContain("asset-manifest.json");
   });
 
   it("keeps accessibility focus, safe areas, and push-to-talk release behavior explicit", () => {
@@ -63,10 +68,19 @@ describe("PWA and repository smoke checks", () => {
       expect(app).toContain(`"${release}"`);
     }
     expect(app).not.toContain("setTimeout(() => this.#voice.stopListening()");
+    expect(app).toContain("orbShortcutSurfaceOwnsFocus(event.target)");
+    expect(app).toContain("event.code === \"Space\" && this.#orbShortcutMode");
+    expect(app).toContain('this.#focusAfterRender = "#device-code-title"');
+    expect(app).toContain('this.#focusAfterRender = "#ai-draft-output"');
+    expect(app).not.toContain('id="ai-draft-output" aria-live');
+    expect(app).not.toContain('await import("./orb-sensor")');
+    expect(app).toContain('import { CameraAssist } from "./orb-sensor"');
     expect(styles).toContain("env(safe-area-inset-top)");
     expect(styles).toContain("env(safe-area-inset-right)");
     expect(styles).toContain("env(safe-area-inset-bottom)");
     expect(styles).toContain("linear-gradient(135deg, #765fd8, #4e3cad)");
+    expect(styles).toContain("width: min(100%, 20rem)");
+    expect(styles).toContain("overflow-wrap: anywhere");
   });
 
   it("keeps Adaptive Orb display, speech, and AI authority channels separate", () => {
@@ -76,18 +90,46 @@ describe("PWA and repository smoke checks", () => {
     const stage = app.slice(stageStart, stageEnd);
     expect(app).toContain("this.#aiDraft = result.text;");
     expect(app).toContain("this.#aiVoice = result.voice;");
-    expect(app).toContain("this.#voiceOutput = result.text;");
+    expect(app).toContain('this.#voiceOutput = "Untrusted Copilot draft ready for review below."');
     expect(app).toContain("(voice) => this.#voice.speak(voice)");
     expect(app).not.toContain("this.#voice.speak(result.text)");
     expect(app).toContain("<summary>Spoken version</summary>");
     expect(app).toContain("Spoken version unavailable");
-    expect(stage).toContain("text: this.#aiDraft");
+    expect(stage).toContain("const draft = this.#aiDraft");
+    expect(stage).toContain("text: draft");
     expect(stage).not.toContain("#aiVoice");
+    expect(app).toContain("assertMemberCanOffer(events, quest.questId, memberId)");
+    expect(app).toContain("appendLocalEventExpectedRoot");
+    expect(app).toContain("#routeGeneration");
     const downstream = ["src/peer.ts", "src/storage.ts", "src/heirloom.ts"]
       .map(text)
       .join("\n");
     expect(downstream).not.toContain("VOICE_RESPONSE_MARKER");
     expect(downstream).not.toContain("aiVoice");
+  });
+
+  it("invalidates Circle-scoped async UI and camera work across routes", () => {
+    const app = text("src/app.ts");
+    const disposeStart = app.indexOf("  #disposeRouteState(): void");
+    const dispose = app.slice(
+      disposeStart,
+      app.indexOf("  #navigate", disposeStart),
+    );
+    for (const phrase of [
+      "this.#routeGeneration += 1",
+      'this.#voiceOutput = ""',
+      "this.#clearAiState()",
+      "this.#clearAgentState()",
+      "this.#proposalGate.cancel()",
+      "this.#invalidateCamera()",
+    ]) {
+      expect(dispose).toContain(phrase);
+    }
+    expect(app).toContain("pendingCandidate?.circleId === groupId");
+    expect(app).toContain("#playReservationIsCurrent(groupId, routeGeneration)");
+    expect(app).toContain("#proposalGate.stageReservationIsCurrent(reservation)");
+    expect(app).toContain("generation !== this.#cameraEnableGeneration");
+    expect(app).toContain("routeGeneration !== this.#routeGeneration");
   });
 
   it("uses explicit signaling with no TURN credential and keeps practice on-device", () => {
@@ -129,12 +171,25 @@ describe("PWA and repository smoke checks", () => {
     expect(png.readUInt32BE(20)).toBe(size);
   });
 
-  it("uses no remote script, stylesheet, font, or module CDN", () => {
+  it("keeps normal runtime local and isolates the exact pinned Pyodide exception", () => {
     const runtimeFiles = ["index.html", ...filesUnder("src"), "public/manifest.webmanifest", "public/sw.js"];
     const runtime = runtimeFiles.map(text).join("\n");
     expect(runtime).not.toMatch(/<(?:script|link)[^>]+(?:src|href)=["']https?:/iu);
     expect(runtime).not.toMatch(/@import\s+url\(["']?https?:/iu);
     expect(runtime).not.toMatch(/from\s+["']https?:/u);
+    const cell = text("public/agent-cell.html");
+    expect(text("src/agent-cell.ts")).toContain(
+      'frame.setAttribute("sandbox", "allow-scripts")',
+    );
+    expect(cell).toContain(
+      "script-src 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net",
+    );
+    expect(cell).toContain('const PYODIDE_VERSION = "0.26.4"');
+    expect(cell).toContain("dd583a19c86414f98ae6c2c6d482f409c55679a4");
+    expect(cell).toContain("ac249a9ddfddc9661d3f9093dc3b5149cb947bbba1556312d94f0fcd283bdc98");
+    expect(cell).toContain("event.ports.length !== 1");
+    expect(cell).toContain('window.removeEventListener("message", initialize)');
+    expect(cell).not.toMatch(/allow-same-origin|allow-forms|allow-popups|allow-downloads/iu);
   });
 
   it("indexes four hash-matched BasicAgent-compatible Python sources that execute", () => {
@@ -173,6 +228,74 @@ describe("PWA and repository smoke checks", () => {
     ]) {
       expect(workflow).toContain(phrase);
     }
+    expect(workflow).toContain("pull_request:");
+    expect(workflow).toContain("github.event_name != 'pull_request'");
+  });
+
+  it("ships legal documents and generates a complete JS/CSS precache manifest", () => {
+    const config = text("vite.config.ts");
+    const serviceWorker = text("public/sw.js");
+    for (const file of [
+      "NOTICE.md",
+      "LICENSE",
+      "ROADMAP.md",
+      "SECURITY.md",
+      "PRIVACY.md",
+      "PROTOCOL.md",
+    ]) {
+      expect(config).toContain(`"${file}"`);
+      expect(serviceWorker).toContain(file);
+    }
+    expect(config).toContain('fileName: "asset-manifest.json"');
+    expect(text("scripts/verify-build.mjs")).toContain(
+      "does not list every built JS/CSS chunk",
+    );
+    expect(text("NOTICE.md")).not.toContain("/tmp/");
+    expect(text("NOTICE.md")).toContain("kody-w/rapp-moonshots");
+  });
+
+  it("never replaces the cached navigation shell with an online 404", async () => {
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    const put = vi.fn(async () => undefined);
+    const cache = {
+      put,
+      match: vi.fn(async () => undefined),
+      addAll: vi.fn(async () => undefined),
+    };
+    const context = {
+      self: {
+        location: { origin: "https://example.test" },
+        addEventListener(type: string, listener: (event: Record<string, unknown>) => void) {
+          listeners.set(type, listener);
+        },
+      },
+      caches: {
+        open: vi.fn(async () => cache),
+        match: vi.fn(async () => undefined),
+        keys: vi.fn(async () => []),
+        delete: vi.fn(async () => true),
+      },
+      fetch: vi.fn(async () => new Response("not found", { status: 404 })),
+      URL,
+      Set,
+      Promise,
+      Response,
+      Error,
+    };
+    runInNewContext(text("public/sw.js"), context);
+    let responsePromise: Promise<Response> | undefined;
+    listeners.get("fetch")?.({
+      request: {
+        method: "GET",
+        mode: "navigate",
+        url: "https://example.test/rapp-heir/",
+      },
+      respondWith(value: Promise<Response>) {
+        responsePromise = value;
+      },
+    });
+    expect((await responsePromise)?.status).toBe(404);
+    expect(put).not.toHaveBeenCalled();
   });
 
   it("uses Pocket Quest Master rather than the avoided public product term", () => {

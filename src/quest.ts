@@ -186,6 +186,23 @@ export function offeringPayload(offering: QuestOffering): Record<string, unknown
   };
 }
 
+export function assertMemberCanOffer(
+  events: readonly SignedEvent[],
+  questId: string,
+  memberId: string,
+): void {
+  if (
+    events.some(
+      (event) =>
+        event.body.type === "quest.offering" &&
+        event.body.payload.questId === questId &&
+        event.body.memberId === memberId,
+    )
+  ) {
+    throw new Error("This companion has already offered to this quest");
+  }
+}
+
 export async function deriveQuestLeg(
   quest: Quest,
   memberId: string,

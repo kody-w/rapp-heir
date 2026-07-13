@@ -1,5 +1,5 @@
 import { type DBSchema, type IDBPDatabase, openDB } from "idb";
-import { canonicalBytes, randomId, sha256 } from "./canonical";
+import { canonicalBytes, randomId, sha256, sha256Sync } from "./canonical";
 import {
   createSignedEvent,
   memberIdFromPublicKey,
@@ -60,6 +60,47 @@ interface HeirDatabase extends DBSchema {
 }
 
 export type ReplicaDatabase = IDBPDatabase<HeirDatabase>;
+
+const mutationTails = new Map<string, Promise<void>>();
+
+async function withInProcessCircleQueue<T>(
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = mutationTails.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const hold = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => undefined).then(() => hold);
+  mutationTails.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (mutationTails.get(key) === tail) {
+      void tail.finally(() => {
+        if (mutationTails.get(key) === tail) mutationTails.delete(key);
+      });
+    }
+  }
+}
+
+export async function withCircleMutationLock<T>(
+  db: ReplicaDatabase,
+  groupId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = `${db.name}:${groupId}`;
+  const run = (): Promise<T> => withInProcessCircleQueue(key, operation);
+  const locks =
+    typeof navigator === "undefined"
+      ? undefined
+      : navigator.locks;
+  if (!locks) return run();
+  return locks.request(`rapp-heir:circle:${key}`, { mode: "exclusive" }, run);
+}
 
 export function openReplicaDatabase(name = DATABASE_NAME): Promise<ReplicaDatabase> {
   return openDB<HeirDatabase>(name, DATABASE_VERSION, {
@@ -143,7 +184,9 @@ export async function createCircleDraft(
     demo,
   };
   validateGroup(group);
-  await db.put("groups", group);
+  await withCircleMutationLock(db, group.id, () =>
+    db.put("groups", group).then(() => undefined),
+  );
   return group;
 }
 
@@ -161,12 +204,14 @@ export async function listCircles(db: ReplicaDatabase): Promise<CircleRecord[]> 
 
 export async function saveCircle(db: ReplicaDatabase, group: CircleRecord): Promise<string> {
   validateGroup(group);
-  const transaction = db.transaction(["groups", "events"], "readwrite");
-  const events = await transaction.objectStore("events").index("by-group").getAll(group.id);
-  assertReplicaStateBounds(group, events);
-  const key = await transaction.objectStore("groups").put(structuredClone(group));
-  await transaction.done;
-  return key;
+  return withCircleMutationLock(db, group.id, async () => {
+    const transaction = db.transaction(["groups", "events"], "readwrite");
+    const events = await transaction.objectStore("events").index("by-group").getAll(group.id);
+    assertReplicaStateBounds(group, events);
+    const key = await transaction.objectStore("groups").put(structuredClone(group));
+    await transaction.done;
+    return key;
+  });
 }
 
 export function getCircleEvents(db: ReplicaDatabase, groupId: string): Promise<SignedEvent[]> {
@@ -175,6 +220,21 @@ export function getCircleEvents(db: ReplicaDatabase, groupId: string): Promise<S
 
 export async function eventRoot(events: readonly SignedEvent[]): Promise<string> {
   return sha256([...new Set(events.map((event) => event.id))].sort());
+}
+
+export function eventRootSync(events: readonly SignedEvent[]): string {
+  return sha256Sync([...new Set(events.map((event) => event.id))].sort());
+}
+
+export function canonicalGroupDigest(group: CircleRecord): string {
+  const normalized = structuredClone(group);
+  validateGroup(normalized);
+  return sha256Sync(normalized);
+}
+
+export interface GroupUpdateBinding {
+  eventRoot: string;
+  groupDigest: string;
 }
 
 export function assertReplicaBounds(bundle: ReplicaBundle): void {
@@ -222,8 +282,9 @@ export async function buildReplicaBundle(
   return bundle;
 }
 
-async function prepareLocalEvent(
-  db: ReplicaDatabase,
+async function prepareLocalEventFromState(
+  currentGroup: CircleRecord,
+  allEvents: readonly SignedEvent[],
   groupId: string,
   identity: LocalIdentity,
   type: string,
@@ -231,15 +292,14 @@ async function prepareLocalEvent(
   now = new Date(),
   updatedGroup?: CircleRecord,
 ): Promise<{ event: SignedEvent; outbox: OutboxRecord; group: CircleRecord }> {
-  const group = await db.get("groups", groupId);
-  if (!group || !group.members[identity.memberId]) throw new Error("Local companion is not enrolled in this Circle");
+  const group = structuredClone(currentGroup);
+  if (!group.members[identity.memberId]) throw new Error("Local companion is not enrolled in this Circle");
   validateGroup(group);
   const replicaGroup = updatedGroup ? structuredClone(updatedGroup) : group;
   if (replicaGroup.id !== group.id || !replicaGroup.members[identity.memberId]) {
     throw new Error("Atomic group update does not match the local Circle");
   }
   validateGroup(replicaGroup);
-  const allEvents = await getCircleEvents(db, groupId);
   const existing = allEvents.filter((event) => event.body.memberId === identity.memberId);
   let sequence = 1;
   let previous: string | null = null;
@@ -275,13 +335,40 @@ async function prepareLocalEvent(
   return { event, outbox, group: replicaGroup };
 }
 
-export async function appendLocalEvent(
+async function prepareLocalEvent(
   db: ReplicaDatabase,
   groupId: string,
   identity: LocalIdentity,
   type: string,
   payload: Record<string, unknown>,
   now = new Date(),
+  updatedGroup?: CircleRecord,
+): Promise<{ event: SignedEvent; outbox: OutboxRecord; group: CircleRecord }> {
+  const [group, allEvents] = await Promise.all([
+    db.get("groups", groupId),
+    getCircleEvents(db, groupId),
+  ]);
+  if (!group) throw new Error("Local companion is not enrolled in this Circle");
+  return prepareLocalEventFromState(
+    group,
+    allEvents,
+    groupId,
+    identity,
+    type,
+    payload,
+    now,
+    updatedGroup,
+  );
+}
+
+async function appendLocalEventUnlocked(
+  db: ReplicaDatabase,
+  groupId: string,
+  identity: LocalIdentity,
+  type: string,
+  payload: Record<string, unknown>,
+  now = new Date(),
+  expectedRoot?: string,
 ): Promise<SignedEvent> {
   const { event, outbox } = await prepareLocalEvent(db, groupId, identity, type, payload, now);
   const transaction = db.transaction(["groups", "events", "outbox"], "readwrite");
@@ -290,10 +377,53 @@ export async function appendLocalEvent(
     transaction.objectStore("events").index("by-group").getAll(groupId),
   ]);
   if (!currentGroup) throw new Error("Circle disappeared before local append");
+  if (expectedRoot !== undefined && eventRootSync(currentEvents) !== expectedRoot) {
+    transaction.abort();
+    await transaction.done.catch(() => undefined);
+    throw new Error("Circle state changed before atomic append");
+  }
   assertReplicaStateBounds(currentGroup, [...currentEvents, event], now.toISOString());
   await Promise.all([transaction.objectStore("events").add(event), transaction.objectStore("outbox").put(outbox)]);
   await transaction.done;
   return event;
+}
+
+export function appendLocalEvent(
+  db: ReplicaDatabase,
+  groupId: string,
+  identity: LocalIdentity,
+  type: string,
+  payload: Record<string, unknown>,
+  now = new Date(),
+): Promise<SignedEvent> {
+  return withCircleMutationLock(db, groupId, () =>
+    appendLocalEventUnlocked(db, groupId, identity, type, payload, now),
+  );
+}
+
+export function appendLocalEventExpectedRoot(
+  db: ReplicaDatabase,
+  groupId: string,
+  identity: LocalIdentity,
+  type: string,
+  payload: Record<string, unknown>,
+  expectedRoot: string,
+  now = new Date(),
+): Promise<SignedEvent> {
+  if (!/^[A-Za-z0-9_-]{20,}$/u.test(expectedRoot)) {
+    return Promise.reject(new Error("Expected Circle event root is invalid"));
+  }
+  return withCircleMutationLock(db, groupId, () =>
+    appendLocalEventUnlocked(
+      db,
+      groupId,
+      identity,
+      type,
+      payload,
+      now,
+      expectedRoot,
+    ),
+  );
 }
 
 export async function appendLocalEventWithGroupUpdate(
@@ -303,27 +433,67 @@ export async function appendLocalEventWithGroupUpdate(
   type: string,
   payload: Record<string, unknown>,
   updatedGroup: CircleRecord,
+  expected: GroupUpdateBinding,
   now = new Date(),
 ): Promise<SignedEvent> {
-  const { event, outbox, group } = await prepareLocalEvent(
-    db,
-    groupId,
-    identity,
-    type,
-    payload,
-    now,
-    updatedGroup,
-  );
-  const transaction = db.transaction(["groups", "events", "outbox"], "readwrite");
-  const currentEvents = await transaction.objectStore("events").index("by-group").getAll(groupId);
-  assertReplicaStateBounds(group, [...currentEvents, event], now.toISOString());
-  await Promise.all([
-    transaction.objectStore("groups").put(group),
-    transaction.objectStore("events").add(event),
-    transaction.objectStore("outbox").put(outbox),
-  ]);
-  await transaction.done;
-  return event;
+  if (
+    !/^[A-Za-z0-9_-]{43}$/u.test(expected.eventRoot) ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(expected.groupDigest)
+  ) {
+    throw new Error("Expected structural update binding is invalid");
+  }
+  const groupUpdate = structuredClone(updatedGroup);
+  const binding = structuredClone(expected);
+  return withCircleMutationLock(db, groupId, async () => {
+    const snapshotTransaction = db.transaction(["groups", "events"], "readwrite");
+    const [snapshotGroup, snapshotEvents] = await Promise.all([
+      snapshotTransaction.objectStore("groups").get(groupId),
+      snapshotTransaction.objectStore("events").index("by-group").getAll(groupId),
+    ]);
+    if (
+      !snapshotGroup ||
+      eventRootSync(snapshotEvents) !== binding.eventRoot ||
+      canonicalGroupDigest(snapshotGroup) !== binding.groupDigest
+    ) {
+      snapshotTransaction.abort();
+      await snapshotTransaction.done.catch(() => undefined);
+      throw new Error("Circle state changed before atomic structural update");
+    }
+    await snapshotTransaction.done;
+
+    const { event, outbox, group } = await prepareLocalEventFromState(
+      snapshotGroup,
+      snapshotEvents,
+      groupId,
+      identity,
+      type,
+      payload,
+      now,
+      groupUpdate,
+    );
+    const transaction = db.transaction(["groups", "events", "outbox"], "readwrite");
+    const [currentGroup, currentEvents] = await Promise.all([
+      transaction.objectStore("groups").get(groupId),
+      transaction.objectStore("events").index("by-group").getAll(groupId),
+    ]);
+    if (
+      !currentGroup ||
+      eventRootSync(currentEvents) !== binding.eventRoot ||
+      canonicalGroupDigest(currentGroup) !== binding.groupDigest
+    ) {
+      transaction.abort();
+      await transaction.done.catch(() => undefined);
+      throw new Error("Circle state changed before atomic structural update");
+    }
+    assertReplicaStateBounds(group, [...currentEvents, event], now.toISOString());
+    await Promise.all([
+      transaction.objectStore("groups").put(group),
+      transaction.objectStore("events").add(event),
+      transaction.objectStore("outbox").put(outbox),
+    ]);
+    await transaction.done;
+    return event;
+  });
 }
 
 export async function makeReplicaBundle(
@@ -640,7 +810,7 @@ async function certificateApprovesChapter(
   return approvals >= threshold;
 }
 
-export async function mergeReplicaBundle(
+async function mergeReplicaBundleUnlocked(
   db: ReplicaDatabase,
   bundle: ReplicaBundle,
 ): Promise<{ added: number; duplicates: number; root: string }> {
@@ -685,23 +855,34 @@ export async function mergeReplicaBundle(
   return { added, duplicates, root: await eventRoot([...mergedEvents.values()]) };
 }
 
+export function mergeReplicaBundle(
+  db: ReplicaDatabase,
+  bundle: ReplicaBundle,
+): Promise<{ added: number; duplicates: number; root: string }> {
+  return withCircleMutationLock(db, bundle.group.id, () =>
+    mergeReplicaBundleUnlocked(db, bundle),
+  );
+}
+
 export async function markOutbox(
   db: ReplicaDatabase,
   groupId: string,
   eventIds: readonly string[],
   state: OutboxRecord["state"],
 ): Promise<void> {
-  const transaction = db.transaction("outbox", "readwrite");
-  for (const eventId of eventIds) {
-    await transaction.store.put({
-      id: `${groupId}:${eventId}`,
-      groupId,
-      eventId,
-      state,
-      updatedAt: new Date().toISOString(),
-    });
-  }
-  await transaction.done;
+  await withCircleMutationLock(db, groupId, async () => {
+    const transaction = db.transaction("outbox", "readwrite");
+    for (const eventId of eventIds) {
+      await transaction.store.put({
+        id: `${groupId}:${eventId}`,
+        groupId,
+        eventId,
+        state,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    await transaction.done;
+  });
 }
 
 export async function getSetting<T>(db: ReplicaDatabase, key: string): Promise<T | undefined> {

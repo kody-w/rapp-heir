@@ -70,6 +70,15 @@ code {
   color: #d9d0ff;
 }
 
+p,
+li,
+dd,
+output,
+pre,
+blockquote {
+  overflow-wrap: anywhere;
+}
+
 .skip-link {
   position: fixed;
   z-index: 100;
@@ -848,6 +857,7 @@ dd {
 
 .orb-conversation,
 .proposal-card,
+.agent-preview-card,
 .ai-preview-card,
 .ai-draft-card,
 .device-code-panel {
@@ -861,6 +871,11 @@ dd {
 
 .proposal-card {
   border-color: rgba(255, 185, 139, 0.55);
+}
+
+.agent-preview-card {
+  margin-top: 1rem;
+  border-color: rgba(169, 151, 255, 0.55);
 }
 
 .ai-preview-card {
@@ -915,6 +930,7 @@ dd {
 }
 
 .proposal-card pre,
+.agent-preview-card pre,
 .ai-preview-card pre {
   max-height: 18rem;
   padding: 0.8rem;
@@ -1076,23 +1092,60 @@ footer {
   }
 
   .adaptive-orb {
-    width: calc(100% - 0.5rem);
-    min-height: 20rem;
+    width: min(100%, 20rem);
+    min-height: 0;
+    aspect-ratio: 1;
   }
 
   .orb-petals li {
-    width: 6.6rem;
+    width: 5.1rem;
   }
 
   .orb-petal {
-    min-height: 58px;
-    padding: 0.4rem;
-    font-size: 0.76rem;
+    min-height: 52px;
+    padding: 0.3rem;
+    font-size: 0.7rem;
   }
 
   .orb-center {
-    width: 7.8rem;
-    min-height: 7.8rem;
+    width: 6.8rem;
+    min-height: 6.8rem;
+  }
+
+  .orb-petals li:nth-child(1) {
+    top: 10%;
+  }
+
+  .orb-petals li:nth-child(2) {
+    top: 23%;
+    left: 76%;
+  }
+
+  .orb-petals li:nth-child(3) {
+    left: 84%;
+  }
+
+  .orb-petals li:nth-child(4) {
+    top: 77%;
+    left: 76%;
+  }
+
+  .orb-petals li:nth-child(5) {
+    top: 90%;
+  }
+
+  .orb-petals li:nth-child(6) {
+    top: 77%;
+    left: 24%;
+  }
+
+  .orb-petals li:nth-child(7) {
+    left: 16%;
+  }
+
+  .orb-petals li:nth-child(8) {
+    top: 23%;
+    left: 24%;
   }
 
   .manifest dl div,

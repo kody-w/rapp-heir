@@ -2,9 +2,13 @@ import { generateIdentity } from "./crypto";
 import { deriveGenesis } from "./organism";
 import {
   appendLocalEvent,
+  appendLocalEventExpectedRoot,
   appendLocalEventWithGroupUpdate,
+  canonicalGroupDigest,
   createCircleDraft,
+  eventRoot,
   getCircle,
+  getCircleEvents,
   getSetting,
   saveCircle,
   setSetting,
@@ -18,7 +22,10 @@ export async function finalizeCircle(
   identity: LocalIdentity,
   now = new Date(),
 ): Promise<CircleRecord> {
-  const group = await getCircle(database, groupId);
+  const [group, events] = await Promise.all([
+    getCircle(database, groupId),
+    getCircleEvents(database, groupId),
+  ]);
   if (!group) throw new Error("Circle not found");
   if (group.status !== "forming") throw new Error("Circle is already founded");
   if (group.coordinatorId !== identity.memberId) {
@@ -26,6 +33,10 @@ export async function finalizeCircle(
   }
   const founders = Object.values(group.members).filter((member) => member.active);
   if (founders.length < 2) throw new Error("At least two people must complete QR + PIN before first breath");
+  const expected = {
+    eventRoot: await eventRoot(events),
+    groupDigest: canonicalGroupDigest(group),
+  };
   const genesis = await deriveGenesis(founders);
   const founded: CircleRecord = {
     ...group,
@@ -54,6 +65,7 @@ export async function finalizeCircle(
       coordinatorIsOwner: false,
     },
     founded,
+    expected,
     now,
   );
   return founded;
@@ -105,4 +117,23 @@ export async function appendDemoEvent(
   const demo = await getDemoIdentity(database, groupId);
   if (!demo) throw new Error("This is not an offline practice Circle");
   return appendLocalEvent(database, groupId, demo, type, payload);
+}
+
+export async function appendDemoEventExpectedRoot(
+  database: ReplicaDatabase,
+  groupId: string,
+  type: string,
+  payload: Record<string, unknown>,
+  expectedRoot: string,
+): Promise<SignedEvent> {
+  const demo = await getDemoIdentity(database, groupId);
+  if (!demo) throw new Error("This is not an offline practice Circle");
+  return appendLocalEventExpectedRoot(
+    database,
+    groupId,
+    demo,
+    type,
+    payload,
+    expectedRoot,
+  );
 }

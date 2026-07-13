@@ -40,6 +40,25 @@ const copilot = {
   expires_at: 9_999_999_999,
 };
 
+function nonSimpleRequestHeaders(init: RequestInit | undefined): string[] {
+  const headers = new Headers(init?.headers);
+  const nonSimple: string[] = [];
+  headers.forEach((value, name) => {
+    const lower = name.toLowerCase();
+    if (["accept", "accept-language", "content-language"].includes(lower)) return;
+    if (lower === "content-type") {
+      const mime = value.split(";", 1)[0]?.trim().toLowerCase();
+      if (
+        mime === "application/x-www-form-urlencoded" ||
+        mime === "multipart/form-data" ||
+        mime === "text/plain"
+      ) return;
+    }
+    nonSimple.push(lower);
+  });
+  return nonSimple.sort();
+}
+
 async function connectedService(
   chatResponse?: (url: string, init?: RequestInit) => Response | Promise<Response>,
 ) {
@@ -99,8 +118,15 @@ describe("vBrainstem GitHub device login", () => {
     expect(String(calls[0]?.init?.body)).not.toMatch(/circle|quest|member/iu);
     for (const call of calls.slice(0, 3)) {
       expect(call.init?.cache).toBe("no-store");
-      expect(new Headers(call.init?.headers).get("Cache-Control")).toBe("no-store");
+      expect(call.init?.credentials).toBe("omit");
+      expect(call.init?.referrerPolicy).toBe("no-referrer");
+      expect(new Headers(call.init?.headers).get("Cache-Control")).toBeNull();
     }
+    expect(calls.slice(0, 3).map((call) => nonSimpleRequestHeaders(call.init))).toEqual([
+      ["content-type"],
+      ["content-type"],
+      ["authorization"],
+    ]);
     expect(storage.getItem).not.toHaveBeenCalled();
     expect(storage.setItem).not.toHaveBeenCalled();
     expect(storage.removeItem).not.toHaveBeenCalled();
@@ -181,6 +207,38 @@ describe("vBrainstem GitHub device login", () => {
     expect(await session.completion).toEqual({ status: "cancelled" });
     expect(stale.authenticated).toBe(false);
   });
+
+  it("does not commit a staged GitHub token when cancelled during Copilot exchange", async () => {
+    let resolveExchange!: (response: Response) => void;
+    const exchange = new Promise<Response>((resolve) => {
+      resolveExchange = resolve;
+    });
+    const fetch = vi.fn((request: RequestInfo | URL) => {
+      const url = String(request);
+      if (url.endsWith("/api/auth/device")) return Promise.resolve(json(device));
+      if (url.endsWith("/api/auth/device/poll")) {
+        return Promise.resolve(json({ access_token: "staged-github-token" }));
+      }
+      return exchange;
+    });
+    const service = new IntelligenceService({
+      fetch: fetch as typeof globalThis.fetch,
+      sleep: async () => undefined,
+      now: () => 1_000,
+    });
+    const session = await service.startDeviceLogin();
+    await vi.waitFor(() =>
+      expect(
+        fetch.mock.calls.some(([request]) =>
+          String(request).endsWith("/api/copilot/token"),
+        ),
+      ).toBe(true),
+    );
+    session.cancel();
+    resolveExchange(json(copilot));
+    await expect(session.completion).resolves.toEqual({ status: "cancelled" });
+    expect(service.authenticated).toBe(false);
+  });
 });
 
 describe("bounded Copilot context and endpoints", () => {
@@ -241,7 +299,7 @@ describe("bounded Copilot context and endpoints", () => {
 
   it("transmits the preview text exactly and exposes no tools or authority", async () => {
     let body = "";
-    const { service } = await connectedService((_url, init) => {
+    const { service, calls } = await connectedService((_url, init) => {
       body = String(init?.body);
       return json({
         choices: [
@@ -266,6 +324,13 @@ describe("bounded Copilot context and endpoints", () => {
     );
     expect(request).not.toHaveProperty("tools");
     expect(request).not.toHaveProperty("tool_choice");
+    const chatCall = calls.at(-1);
+    expect(chatCall?.init?.cache).toBe("no-store");
+    expect(new Headers(chatCall?.init?.headers).has("Cache-Control")).toBe(false);
+    expect(nonSimpleRequestHeaders(chatCall?.init)).toEqual([
+      "authorization",
+      "content-type",
+    ]);
     const system = request.messages[0]?.content ?? "";
     expect(system.match(/\|\|\|VOICE\|\|\|/gu)).toHaveLength(1);
     expect(system).toMatch(/exactly one/iu);
@@ -295,14 +360,14 @@ describe("RAPP Installer voice response contract", () => {
     });
   });
 
-  it("splits only once when the untrusted tail contains another marker", () => {
+  it("requires exactly one marker and never speaks a multiple-marker tail", () => {
     expect(
       parseIntelligenceResult(
         `Display answer${VOICE_RESPONSE_MARKER}Spoken first ${VOICE_RESPONSE_MARKER} untrusted remainder`,
       ),
     ).toEqual({
       text: "Display answer",
-      voice: `Spoken first ${VOICE_RESPONSE_MARKER} untrusted remainder`,
+      voice: "",
     });
   });
 
@@ -340,6 +405,22 @@ describe("RAPP Installer voice response contract", () => {
     ]);
     expect(displays.join(" ")).not.toContain("VOICE");
     expect(displays.join(" ")).not.toContain("Voice tail");
+  });
+
+  it("never turns malformed SSE/JSON or malformed markers into speech", () => {
+    for (const raw of [
+      `Display|||VOICE||Spoken canary`,
+      `Display${VOICE_RESPONSE_MARKER}Voice${VOICE_RESPONSE_MARKER}Canary`,
+      `Display${VOICE_RESPONSE_MARKER}data: {"voice":"raw protocol"}`,
+      'data: {"choices":[{"delta":{"content":"raw canary"}}',
+      '{"choices": [not valid JSON]}',
+    ]) {
+      const buffered = parseBufferedChatResponse(raw);
+      const result = parseIntelligenceResult(buffered);
+      expect(result.voice).toBe("");
+      expect(result.text).not.toContain("Spoken canary");
+      expect(result.text).not.toContain("raw canary");
+    }
   });
 
   it("speaks only a current voice tail, at most once, and rejects stale or missing tails", () => {
@@ -501,5 +582,45 @@ describe("Copilot response transport", () => {
     expect(displays.at(-1)).toBe("# Display answer");
     expect(displays.join("\n")).not.toContain(VOICE_RESPONSE_MARKER);
     expect(displays.join("\n")).not.toContain("Plain spoken answer");
+  });
+
+  it("a new preview request aborts the old stream and only the current result enters history", async () => {
+    let chats = 0;
+    const cancel = vi.fn();
+    const { service } = await connectedService(() => {
+      chats += 1;
+      if (chats === 1) {
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start() {},
+            cancel,
+          }),
+          { headers: { "Content-Type": "text/event-stream" } },
+        );
+      }
+      return json({
+        choices: [
+          {
+            message: {
+              content: `Current display${VOICE_RESPONSE_MARKER}Current voice.`,
+            },
+          },
+        ],
+      });
+    });
+    const firstPreview = buildRemoteContextPreview({ draft: "First stale preview." });
+    const secondPreview = buildRemoteContextPreview({ draft: "Second current preview." });
+    const first = service.chat(await approveRemoteContext(firstPreview));
+    await vi.waitFor(() => expect(chats).toBe(1));
+    const second = service.chat(await approveRemoteContext(secondPreview));
+    await expect(first).rejects.toMatchObject({ name: "AbortError" });
+    await expect(second).resolves.toEqual({
+      text: "Current display",
+      voice: "Current voice.",
+    });
+    expect(cancel).toHaveBeenCalled();
+    expect(service.chatHistory).toHaveLength(2);
+    expect(service.chatHistory[0]?.text).toContain("Second current preview");
+    expect(JSON.stringify(service.chatHistory)).not.toContain("First stale preview");
   });
 });

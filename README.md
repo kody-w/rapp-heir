@@ -45,6 +45,26 @@ optional details caption. A missing or malformed separator leaves speech unavail
 formatted answer aloud. The voice tail is transient and never enters commands, chat history, proposals, signed
 events, replica/PeerJS exchange, or heirlooms.
 
+## Verified local RAPP agents
+
+The Mind tunnel can run the built-in `QuestMaster` and optional `QuestSafety` as real Python in CPython through
+Pyodide 0.26.4. The host creates `agent-cell.html` only on demand with an opaque-origin
+`sandbox="allow-scripts"` iframe. That headless cell owns a Web Worker and communicates over one transferred private
+`MessagePort`; it receives bounded JSON context but no DOM, storage, signing, PeerJS, Copilot, key, or other host
+capability.
+
+The cell fetches only the exact manifest at Rapp Heir commit
+`dd583a19c86414f98ae6c2c6d482f409c55679a4`, verifies its full SHA-256
+`ac249a9ddfddc9661d3f9093dc3b5149cb947bbba1556312d94f0fcd283bdc98`, resolves only allowlisted simple
+`*_agent.py` children, and verifies each full source hash before `compile`/`exec` in a fresh namespace. It calls only
+`AGENT.perform(**args)`. Output is inert bounded data: the app shows the exact output, parses typed quest fields, and
+stages the normal pending proposal. A local user must still Review & sign.
+
+First use requires the pinned jsDelivr Pyodide files and pinned `raw.githubusercontent.com` sources. The service
+worker intentionally bypasses both origins. Normal browser HTTP caches may help later, but persistence, offline
+reuse, and availability are not guaranteed. If either origin or Pyodide is unavailable, the UI says so and uses the
+existing deterministic JavaScript quest generator instead. No peer/Kited-Twin source is ever executed.
+
 Release one creates human companions only. The signed member schema is future-safe for optional Kited Twins, but
 there is deliberately no Kited join UI. See [ROADMAP.md](ROADMAP.md).
 
@@ -60,9 +80,10 @@ npm run build
 npm run dev
 ```
 
-Vite’s production base is `/rapp-heir/`. No runtime asset uses a CDN. The custom service worker caches the local shell,
-hashed build assets after first fetch, icons, manifest, and bundled agent source. GitHub Pages deployment is defined in
-`.github/workflows/pages.yml`.
+Vite’s production base is `/rapp-heir/`. App code, styles, icons, and normal dependencies are local; only the
+explicit on-demand verified Python path uses pinned Pyodide from jsDelivr and commit-pinned raw GitHub source. The
+custom service worker caches `agent-cell.html`, the local shell, and every build-manifest JS/CSS asset, but bypasses
+Pyodide, raw GitHub, auth, and Copilot requests. GitHub Pages deployment is defined in `.github/workflows/pages.yml`.
 
 An accepted MVP replica is bounded to **256 signed events and 512 KiB of canonical replica bytes**. Local append,
 import, export, encrypted `.heirpack`, and secure-wire paths refuse atomically before crossing that bound. Rapp Heir
@@ -76,13 +97,16 @@ does not implement chunking in v1.
   `HELLO/SUMMARY/WANT/PACK/ACK`.
 - `src/quest.ts`, `src/commands.ts`: original offline quests, causal Braid legs, and precedence-safe command grammar.
 - `src/adaptive-orb.ts`, `src/pending-proposal.ts`: pure Orb state and frozen two-turn mutation authority.
+- `src/agent-cell.ts`, `src/agent-proposals.ts`, `public/agent-cell.html`: private-port iframe/worker lifecycle,
+  pinned Python verification, and bounded QuestMaster/QuestSafety output parsing.
 - `src/intelligence.ts`: memory-only vBrainstem device login, bounded context preview, allowlisted Copilot
   SSE/proxy transport, marker-safe display/voice parsing, and abort/logout lifecycle.
-- `src/orb-sensor.ts`: lazy, optional FaceDetector-only highlight assist; never an action executor.
+- `src/orb-sensor.ts`: optional FaceDetector-only highlight assist; never an action executor.
 - `src/reunion.ts`, `src/heirloom.ts`: quorum certificates and portable selected-only artifacts.
 - `src/organism.ts`: original Canvas body, lobe/ring rendering, reduced-motion behavior, text equivalent.
-- `public/agents/`: four actual single-file, `BasicAgent`-compatible Python source files, indexed by
-  `public/agents/manifest.json`. They are reference/bundled agents, not skills. Peer-supplied code is never executed.
+- `public/agents/`: four actual single-file, `BasicAgent`-compatible Python source files matching the pinned commit.
+  They are agents, not skills. Execution fetches and verifies the exact pinned raw bytes; peer-supplied code is never
+  executed.
 
 Read [PROTOCOL.md](PROTOCOL.md), [SECURITY.md](SECURITY.md), and [PRIVACY.md](PRIVACY.md) before deployment.
 
@@ -93,8 +117,8 @@ identity. WebRTC may expose IP/network metadata; NAT or absent TURN paths can pr
 is the supported fallback. The app ships no permanent TURN credentials or relay guarantee. QR/PIN ceremonies can be relayed. Signatures and certificates prove possession of enrolled
 keys—not legal identity, truth of a contribution, or physical location.
 
-Browser/platform speech recognition may use a network service even though Rapp Heir requests local processing where
-supported; speech synthesis behavior also depends on the installed browser/platform voice. The optional local camera
+Browser/platform speech recognition and speech synthesis may use platform, browser, or vendor services, including
+network services, even though Rapp Heir requests local recognition where supported. The optional local camera
 assist requests video only and stores no pixels/vectors; without FaceDetector it stays disabled. Copilot
 availability, entitlement, direct CORS, and the Cloudflare worker are not guaranteed. Typed play and bundled quest
 templates remain authoritative offline. This MVP has no account recovery, key rotation, multi-device identity, or

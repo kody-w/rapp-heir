@@ -134,7 +134,10 @@ export class CameraAssist {
       video.srcObject = stream;
       await video.play();
       if (generation !== this.#generation) {
-        this.disable();
+        stream.getTracks().forEach((track) => track.stop());
+        if (this.#stream === stream) this.#stream = undefined;
+        if (this.#video === video) this.#video = undefined;
+        if (video.srcObject === stream) video.srcObject = null;
         return { enabled: false, reason: "unavailable" };
       }
       const detector = this.#createFaceDetector();

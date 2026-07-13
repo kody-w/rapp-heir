@@ -1,0 +1,645 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; connect-src https://cdn.jsdelivr.net https://raw.githubusercontent.com; worker-src blob:; img-src 'none'; media-src 'none'; style-src 'none'; font-src 'none'; object-src 'none'; frame-src 'none'; child-src 'none'; form-action 'none'; base-uri 'none'"
+    >
+    <meta name="referrer" content="no-referrer">
+    <title>Verified local RAPP agent cell</title>
+  </head>
+  <body hidden>
+    <script>
+      (() => {
+        "use strict";
+
+        const BOOT_TIMEOUT_MS = 60_000;
+        const RUN_TIMEOUT_MS = 15_000;
+        const nonce = location.hash.slice(1);
+        let privatePort;
+        let worker;
+        let workerGeneration = 0;
+        let bootTimer;
+        let currentRequest;
+
+        function workerMain() {
+          "use strict";
+
+          const PYODIDE_VERSION = "0.26.4";
+          const PYODIDE_ORIGIN = "https://cdn.jsdelivr.net";
+          const PYODIDE_INDEX = `${PYODIDE_ORIGIN}/pyodide/v${PYODIDE_VERSION}/full/`;
+          const PYODIDE_SCRIPT = `${PYODIDE_INDEX}pyodide.js`;
+          const PINNED_COMMIT = "dd583a19c86414f98ae6c2c6d482f409c55679a4";
+          const RAW_DIRECTORY =
+            `https://raw.githubusercontent.com/kody-w/rapp-heir/${PINNED_COMMIT}/public/agents`;
+          const MANIFEST_URL = `${RAW_DIRECTORY}/manifest.json`;
+          const MANIFEST_SHA256 =
+            "ac249a9ddfddc9661d3f9093dc3b5149cb947bbba1556312d94f0fcd283bdc98";
+          const MAX_MANIFEST_BYTES = 16 * 1024;
+          const MAX_SOURCE_BYTES = 64 * 1024;
+          const MAX_ARGS_BYTES = 16 * 1024;
+          const MAX_RESULT_BYTES = 32 * 1024;
+          const AGENTS = Object.freeze({
+            QuestMaster: "quest_master_agent.py",
+            QuestTurn: "quest_turn_agent.py",
+            PartyMemory: "party_memory_agent.py",
+            QuestSafety: "quest_safety_agent.py",
+          });
+          const encoder = new TextEncoder();
+          const decoder = new TextDecoder("utf-8", { fatal: true });
+          let pyodidePromise;
+          const SHA256_CONSTANTS = new Uint32Array([
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+            0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+            0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+            0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+            0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+          ]);
+
+          function fail(message) {
+            throw new Error(message);
+          }
+
+          function isPlainObject(value) {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            const prototype = Object.getPrototypeOf(value);
+            return prototype === Object.prototype || prototype === null;
+          }
+
+          function exactKeys(value, expected) {
+            const actual = Object.keys(value).sort();
+            const wanted = [...expected].sort();
+            return (
+              actual.length === wanted.length &&
+              actual.every((key, index) => key === wanted[index])
+            );
+          }
+
+          function validateJson(value, depth = 0) {
+            if (depth > 16) fail("Agent arguments exceed the nesting limit");
+            if (
+              value === null ||
+              typeof value === "string" ||
+              typeof value === "boolean"
+            ) {
+              return;
+            }
+            if (typeof value === "number") {
+              if (!Number.isFinite(value)) fail("Agent arguments contain a non-finite number");
+              return;
+            }
+            if (Array.isArray(value)) {
+              if (value.length > 256) fail("Agent arguments contain an oversized array");
+              value.forEach((item) => validateJson(item, depth + 1));
+              return;
+            }
+            if (!isPlainObject(value)) fail("Agent arguments must use plain JSON objects");
+            const entries = Object.entries(value);
+            if (entries.length > 256) fail("Agent arguments contain too many fields");
+            for (const [key, child] of entries) {
+              if (!key || key.length > 128) fail("Agent argument key is invalid");
+              validateJson(child, depth + 1);
+            }
+          }
+
+          function boundedJson(value, maximum, label) {
+            validateJson(value);
+            const text = JSON.stringify(value);
+            if (encoder.encode(text).byteLength > maximum) fail(`${label} exceeds its byte limit`);
+            return text;
+          }
+
+          function rotateRight(value, amount) {
+            return (value >>> amount) | (value << (32 - amount));
+          }
+
+          function digestHex(input) {
+            const paddedLength = Math.ceil((input.byteLength + 9) / 64) * 64;
+            const padded = new Uint8Array(paddedLength);
+            padded.set(input);
+            padded[input.byteLength] = 0x80;
+            const view = new DataView(padded.buffer);
+            const bitLength = input.byteLength * 8;
+            view.setUint32(
+              paddedLength - 8,
+              Math.floor(bitLength / 0x1_0000_0000),
+              false,
+            );
+            view.setUint32(paddedLength - 4, bitLength >>> 0, false);
+            const state = new Uint32Array([
+              0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+              0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            ]);
+            const words = new Uint32Array(64);
+            for (let offset = 0; offset < paddedLength; offset += 64) {
+              for (let index = 0; index < 16; index += 1) {
+                words[index] = view.getUint32(offset + index * 4, false);
+              }
+              for (let index = 16; index < 64; index += 1) {
+                const left = words[index - 15] || 0;
+                const right = words[index - 2] || 0;
+                const sigma0 =
+                  rotateRight(left, 7) ^ rotateRight(left, 18) ^ (left >>> 3);
+                const sigma1 =
+                  rotateRight(right, 17) ^ rotateRight(right, 19) ^ (right >>> 10);
+                words[index] =
+                  ((words[index - 16] || 0) +
+                    sigma0 +
+                    (words[index - 7] || 0) +
+                    sigma1) >>>
+                  0;
+              }
+              let a = state[0] || 0;
+              let b = state[1] || 0;
+              let c = state[2] || 0;
+              let d = state[3] || 0;
+              let e = state[4] || 0;
+              let f = state[5] || 0;
+              let g = state[6] || 0;
+              let h = state[7] || 0;
+              for (let index = 0; index < 64; index += 1) {
+                const sum1 =
+                  rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+                const choose = (e & f) ^ (~e & g);
+                const temporary1 =
+                  (h +
+                    sum1 +
+                    choose +
+                    (SHA256_CONSTANTS[index] || 0) +
+                    (words[index] || 0)) >>>
+                  0;
+                const sum0 =
+                  rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+                const majority = (a & b) ^ (a & c) ^ (b & c);
+                const temporary2 = (sum0 + majority) >>> 0;
+                h = g;
+                g = f;
+                f = e;
+                e = (d + temporary1) >>> 0;
+                d = c;
+                c = b;
+                b = a;
+                a = (temporary1 + temporary2) >>> 0;
+              }
+              state[0] = ((state[0] || 0) + a) >>> 0;
+              state[1] = ((state[1] || 0) + b) >>> 0;
+              state[2] = ((state[2] || 0) + c) >>> 0;
+              state[3] = ((state[3] || 0) + d) >>> 0;
+              state[4] = ((state[4] || 0) + e) >>> 0;
+              state[5] = ((state[5] || 0) + f) >>> 0;
+              state[6] = ((state[6] || 0) + g) >>> 0;
+              state[7] = ((state[7] || 0) + h) >>> 0;
+            }
+            const digest = new Uint8Array(32);
+            const digestView = new DataView(digest.buffer);
+            state.forEach((word, index) =>
+              digestView.setUint32(index * 4, word, false),
+            );
+            return [...digest]
+              .map((byte) => byte.toString(16).padStart(2, "0"))
+              .join("");
+          }
+
+          function allowedMime(response, kind) {
+            const mime = (response.headers.get("content-type") || "")
+              .split(";", 1)[0]
+              .trim()
+              .toLowerCase();
+            return kind === "manifest"
+              ? mime === "text/plain" || mime === "application/json"
+              : mime === "text/plain" ||
+                  mime === "text/x-python" ||
+                  mime === "application/x-python-code";
+          }
+
+          async function readBounded(response, maximum) {
+            const declared = response.headers.get("content-length");
+            if (declared && (!/^\d+$/.test(declared) || Number(declared) > maximum)) {
+              fail("Pinned response exceeds its byte limit");
+            }
+            if (!response.body) {
+              const bytes = new Uint8Array(await response.arrayBuffer());
+              if (bytes.byteLength > maximum) fail("Pinned response exceeds its byte limit");
+              return bytes;
+            }
+            const reader = response.body.getReader();
+            const chunks = [];
+            let length = 0;
+            try {
+              while (true) {
+                const part = await reader.read();
+                if (part.done) break;
+                length += part.value.byteLength;
+                if (length > maximum) {
+                  await reader.cancel();
+                  fail("Pinned response exceeds its byte limit");
+                }
+                chunks.push(part.value);
+              }
+            } finally {
+              reader.releaseLock();
+            }
+            const bytes = new Uint8Array(length);
+            let offset = 0;
+            for (const chunk of chunks) {
+              bytes.set(chunk, offset);
+              offset += chunk.byteLength;
+            }
+            return bytes;
+          }
+
+          async function pinnedFetch(url, maximum, kind) {
+            const response = await fetch(url, {
+              method: "GET",
+              redirect: "error",
+              credentials: "omit",
+              referrerPolicy: "no-referrer",
+            });
+            if (
+              response.status !== 200 ||
+              !response.ok ||
+              response.redirected ||
+              response.url !== url
+            ) {
+              fail(`Pinned ${kind} response did not match its exact URL and status`);
+            }
+            if (!allowedMime(response, kind)) fail(`Pinned ${kind} MIME type is invalid`);
+            return readBounded(response, maximum);
+          }
+
+          function parseManifest(bytes) {
+            let manifest;
+            try {
+              manifest = JSON.parse(decoder.decode(bytes));
+            } catch {
+              fail("Pinned manifest is not valid UTF-8 JSON");
+            }
+            if (
+              !isPlainObject(manifest) ||
+              !exactKeys(manifest, ["format", "version", "execution", "notice", "agents"]) ||
+              manifest.format !== "rapp-basic-agents" ||
+              manifest.version !== 1 ||
+              manifest.execution !== "reference-source-only" ||
+              typeof manifest.notice !== "string" ||
+              !Array.isArray(manifest.agents) ||
+              manifest.agents.length !== Object.keys(AGENTS).length
+            ) {
+              fail("Pinned manifest schema is invalid");
+            }
+            const seen = new Set();
+            for (const entry of manifest.agents) {
+              if (
+                !isPlainObject(entry) ||
+                !exactKeys(entry, ["name", "path", "sha256"]) ||
+                typeof entry.name !== "string" ||
+                typeof entry.path !== "string" ||
+                typeof entry.sha256 !== "string" ||
+                AGENTS[entry.name] !== entry.path ||
+                !/^[a-z0-9_]+_agent\.py$/.test(entry.path) ||
+                !/^[a-f0-9]{64}$/.test(entry.sha256) ||
+                seen.has(entry.name)
+              ) {
+                fail("Pinned manifest contains an invalid agent entry");
+              }
+              seen.add(entry.name);
+            }
+            for (const name of Object.keys(AGENTS)) {
+              if (!seen.has(name)) fail("Pinned manifest omits an allowlisted agent");
+            }
+            return manifest;
+          }
+
+          function loadRuntime() {
+            if (!pyodidePromise) {
+              importScripts(PYODIDE_SCRIPT);
+              if (typeof self.loadPyodide !== "function") {
+                fail("Pinned Pyodide loader is unavailable");
+              }
+              pyodidePromise = self.loadPyodide({ indexURL: PYODIDE_INDEX });
+            }
+            return pyodidePromise;
+          }
+
+          async function runAgent(agent, args) {
+            if (!Object.hasOwn(AGENTS, agent)) fail("Agent name is not allowlisted");
+            const argsJson = boundedJson(args, MAX_ARGS_BYTES, "Agent arguments");
+            const manifestBytes = await pinnedFetch(
+              MANIFEST_URL,
+              MAX_MANIFEST_BYTES,
+              "manifest",
+            );
+            const manifestHash = await digestHex(manifestBytes);
+            if (manifestHash !== MANIFEST_SHA256) fail("Pinned manifest hash mismatch");
+            const manifest = parseManifest(manifestBytes);
+            const entry = manifest.agents.find((candidate) => candidate.name === agent);
+            if (!entry || entry.path !== AGENTS[agent]) fail("Requested agent path is invalid");
+            const sourceUrl = `${RAW_DIRECTORY}/${entry.path}`;
+            const sourceBytes = await pinnedFetch(sourceUrl, MAX_SOURCE_BYTES, "agent");
+            const sourceHash = await digestHex(sourceBytes);
+            if (sourceHash !== entry.sha256) fail("Pinned agent source hash mismatch");
+            let source;
+            try {
+              source = decoder.decode(sourceBytes);
+            } catch {
+              fail("Pinned agent source is not valid UTF-8");
+            }
+            const pyodide = await loadRuntime();
+            pyodide.globals.set("_rapp_source", source);
+            pyodide.globals.set("_rapp_args_json", argsJson);
+            pyodide.globals.set("_rapp_filename", entry.path);
+            let serialized;
+            try {
+              serialized = await pyodide.runPythonAsync(`
+import json
+_rapp_namespace = {"__name__": "__rapp_verified_agent__", "__file__": _rapp_filename}
+_rapp_code = compile(_rapp_source, _rapp_filename, "exec")
+exec(_rapp_code, _rapp_namespace, _rapp_namespace)
+_rapp_agent = _rapp_namespace.get("AGENT")
+if _rapp_agent is None or not callable(getattr(_rapp_agent, "perform", None)):
+    raise ValueError("Verified source does not expose AGENT.perform")
+_rapp_args = json.loads(_rapp_args_json)
+if not isinstance(_rapp_args, dict):
+    raise ValueError("Agent arguments must be an object")
+_rapp_output = _rapp_agent.perform(**_rapp_args)
+if not isinstance(_rapp_output, str):
+    raise ValueError("AGENT.perform must return a string")
+json.dumps({
+    "output": _rapp_output,
+    "metadata": getattr(_rapp_agent, "metadata", {}),
+}, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+`);
+            } finally {
+              pyodide.globals.delete("_rapp_source");
+              pyodide.globals.delete("_rapp_args_json");
+              pyodide.globals.delete("_rapp_filename");
+            }
+            if (typeof serialized !== "string") fail("Verified agent result is invalid");
+            if (encoder.encode(serialized).byteLength > MAX_RESULT_BYTES) {
+              fail("Verified agent result exceeds 32 KiB");
+            }
+            let value;
+            try {
+              value = JSON.parse(serialized);
+            } catch {
+              fail("Verified agent result is not JSON serializable");
+            }
+            if (
+              !isPlainObject(value) ||
+              !exactKeys(value, ["output", "metadata"]) ||
+              typeof value.output !== "string" ||
+              !isPlainObject(value.metadata)
+            ) {
+              fail("Verified agent returned an invalid typed result");
+            }
+            boundedJson(value.metadata, MAX_RESULT_BYTES, "Agent metadata");
+            return {
+              agent,
+              manifestHash,
+              sourceHash,
+              output: value.output,
+              metadata: value.metadata,
+            };
+          }
+
+          self.addEventListener("message", (event) => {
+            const message = event.data;
+            if (!isPlainObject(message)) return;
+            if (message.type === "boot") {
+              void loadRuntime()
+                .then(() => self.postMessage({ type: "worker-ready" }))
+                .catch((error) =>
+                  self.postMessage({
+                    type: "worker-error",
+                    phase: "boot",
+                    message: error instanceof Error ? error.message : "Pyodide boot failed",
+                  }),
+                );
+              return;
+            }
+            if (
+              message.type !== "run-agent" ||
+              typeof message.requestId !== "string" ||
+              typeof message.agent !== "string" ||
+              !isPlainObject(message.args)
+            ) {
+              return;
+            }
+            void runAgent(message.agent, message.args)
+              .then((result) =>
+                self.postMessage({
+                  type: "worker-result",
+                  requestId: message.requestId,
+                  result,
+                }),
+              )
+              .catch((error) =>
+                self.postMessage({
+                  type: "worker-error",
+                  phase: "run",
+                  requestId: message.requestId,
+                  message:
+                    error instanceof Error
+                      ? error.message.slice(0, 400)
+                      : "Verified agent execution failed",
+                }),
+              );
+          });
+        }
+
+        function post(message) {
+          privatePort?.postMessage(message);
+        }
+
+        function stopWorker() {
+          if (bootTimer !== undefined) clearTimeout(bootTimer);
+          bootTimer = undefined;
+          worker?.terminate();
+          worker = undefined;
+          workerGeneration += 1;
+        }
+
+        function startWorker() {
+          stopWorker();
+          const generation = workerGeneration;
+          const blob = new Blob([`(${workerMain.toString()})();`], {
+            type: "text/javascript",
+          });
+          const objectUrl = URL.createObjectURL(blob);
+          const nextWorker = new Worker(objectUrl);
+          URL.revokeObjectURL(objectUrl);
+          worker = nextWorker;
+          bootTimer = setTimeout(() => {
+            if (worker !== nextWorker || generation !== workerGeneration) return;
+            stopWorker();
+            startWorker();
+            post({
+              type: "cell-error",
+              generation,
+              phase: "boot",
+              message: "Pinned Pyodide boot timed out",
+            });
+          }, BOOT_TIMEOUT_MS);
+          nextWorker.addEventListener("message", (event) => {
+            if (worker !== nextWorker || generation !== workerGeneration) return;
+            const message = event.data;
+            if (!message || typeof message !== "object") return;
+            if (message.type === "worker-ready") {
+              if (bootTimer !== undefined) clearTimeout(bootTimer);
+              bootTimer = undefined;
+              post({ type: "cell-ready", generation });
+              return;
+            }
+            if (message.type === "worker-result" && currentRequest) {
+              if (message.requestId !== currentRequest.requestId) return;
+              clearTimeout(currentRequest.timer);
+              const request = currentRequest;
+              currentRequest = undefined;
+              post({
+                type: "agent-result",
+                generation: request.generation,
+                requestId: request.requestId,
+                result: message.result,
+              });
+              return;
+            }
+            if (message.type === "worker-error") {
+              const request = currentRequest;
+              if (request) {
+                clearTimeout(request.timer);
+                currentRequest = undefined;
+              }
+              stopWorker();
+              startWorker();
+              post({
+                type: "cell-error",
+                generation: request?.generation ?? generation,
+                requestId: request?.requestId,
+                phase: message.phase === "boot" ? "boot" : "run",
+                message:
+                  typeof message.message === "string"
+                    ? message.message.slice(0, 400)
+                    : "Verified agent worker failed",
+              });
+            }
+          });
+          nextWorker.addEventListener("error", () => {
+            if (worker !== nextWorker || generation !== workerGeneration) return;
+            const request = currentRequest;
+            if (request) {
+              clearTimeout(request.timer);
+              currentRequest = undefined;
+            }
+            stopWorker();
+            startWorker();
+            post({
+              type: "cell-error",
+              generation: request?.generation ?? generation,
+              requestId: request?.requestId,
+              phase: request ? "run" : "boot",
+              message: "Verified agent worker failed",
+            });
+          });
+          nextWorker.postMessage({ type: "boot" });
+        }
+
+        function handlePrivateMessage(event) {
+          const message = event.data;
+          if (!message || typeof message !== "object") return;
+          if (
+            message.type === "cancel" &&
+            currentRequest &&
+            message.requestId === currentRequest.requestId
+          ) {
+            const request = currentRequest;
+            clearTimeout(request.timer);
+            currentRequest = undefined;
+            stopWorker();
+            startWorker();
+            post({
+              type: "agent-cancelled",
+              generation: request.generation,
+              requestId: request.requestId,
+            });
+            return;
+          }
+          if (
+            message.type !== "run-agent" ||
+            typeof message.requestId !== "string" ||
+            !/^[A-Za-z0-9_-]{12,120}$/.test(message.requestId) ||
+            !Number.isSafeInteger(message.generation) ||
+            typeof message.agent !== "string" ||
+            !message.args ||
+            typeof message.args !== "object" ||
+            Array.isArray(message.args)
+          ) {
+            return;
+          }
+          if (currentRequest || !worker) {
+            post({
+              type: "cell-error",
+              generation: message.generation,
+              requestId: message.requestId,
+              phase: "run",
+              message: currentRequest
+                ? "Another verified agent request is already running"
+                : "Verified agent worker is unavailable",
+            });
+            return;
+          }
+          const request = {
+            generation: message.generation,
+            requestId: message.requestId,
+            timer: setTimeout(() => {
+              if (currentRequest?.requestId !== message.requestId) return;
+              currentRequest = undefined;
+              stopWorker();
+              startWorker();
+              post({
+                type: "cell-error",
+                generation: message.generation,
+                requestId: message.requestId,
+                phase: "run",
+                message: "Verified agent execution timed out",
+              });
+            }, RUN_TIMEOUT_MS),
+          };
+          currentRequest = request;
+          worker.postMessage({
+            type: "run-agent",
+            requestId: message.requestId,
+            agent: message.agent,
+            args: message.args,
+          });
+        }
+
+        function initialize(event) {
+          const message = event.data;
+          if (
+            privatePort ||
+            !/^[a-f0-9]{32}$/.test(nonce) ||
+            !message ||
+            message.type !== "agent-cell-init" ||
+            message.nonce !== nonce ||
+            event.ports.length !== 1
+          ) {
+            return;
+          }
+          window.removeEventListener("message", initialize);
+          privatePort = event.ports[0];
+          privatePort.addEventListener("message", handlePrivateMessage);
+          privatePort.start();
+          startWorker();
+        }
+
+        window.addEventListener("message", initialize);
+      })();
+    </script>
+  </body>
+</html>

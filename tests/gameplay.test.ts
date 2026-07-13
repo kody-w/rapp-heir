@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { deriveGenesis, deriveOrganismState } from "../src/organism";
 import {
   QUEST_ROLES,
+  assertMemberCanOffer,
   createQuest,
   deriveQuestLeg,
   deriveSharedReveal,
@@ -139,6 +140,27 @@ describe("Circle organism and Braid gameplay", () => {
       fullBody.motion,
       fullBody.hue,
     ]);
+  });
+
+  it("enforces one offering per member and quest for manual or AI staging", async () => {
+    const fern = await identity("Fern");
+    const morrow = await identity("Morrow", 1);
+    const group = await groupFor([fern, morrow]);
+    const existing = await signedEvent(group, fern, "quest.offering", {
+      questId: "quest_one_offer",
+      text: "A first answer",
+      choice: "leave one path",
+      approvedForHeirloom: false,
+    });
+    expect(() =>
+      assertMemberCanOffer([existing], "quest_one_offer", fern.memberId),
+    ).toThrow("already offered");
+    expect(() =>
+      assertMemberCanOffer([existing], "quest_one_offer", morrow.memberId),
+    ).not.toThrow();
+    expect(() =>
+      assertMemberCanOffer([existing], "quest_other", fern.memberId),
+    ).not.toThrow();
   });
 
   it("does not let an ordinary signed remote event fake a structural molt", async () => {

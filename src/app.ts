@@ -3,14 +3,33 @@ import {
   adaptiveOrbReducer,
   createAdaptiveOrbState,
   highlightedPetal,
+  orbShortcutSurfaceOwnsFocus,
   shouldIgnoreOrbShortcut,
   withOrbContext,
   type AdaptiveOrbState,
   type OrbActionId,
   type OrbActivation,
 } from "./adaptive-orb";
+import {
+  AgentCellClient,
+  PINNED_AGENT_MANIFEST_HASH,
+  PYODIDE_VERSION,
+  type AgentCellResult,
+} from "./agent-cell";
+import {
+  parseQuestMasterOutput,
+  parseQuestSafetyOutput,
+  questSafetyCandidate,
+  type QuestMasterProposal,
+  type QuestSafetyDecision,
+} from "./agent-proposals";
 import { canonicalStringify, boundedJsonParse } from "./canonical";
-import { createOfflineDemo, appendDemoEvent, finalizeCircle, getDemoIdentity } from "./circle";
+import {
+  createOfflineDemo,
+  appendDemoEventExpectedRoot,
+  finalizeCircle,
+  getDemoIdentity,
+} from "./circle";
 import { parseOrbInput, VoicePocketGM, type PocketCommand } from "./commands";
 import { decryptHeirpack, encryptHeirpack, generateIdentity } from "./crypto";
 import { heirloomEligibility, importVerifiedHeirloom, mintHeirloom, verifyHeirloom } from "./heirloom";
@@ -25,6 +44,7 @@ import {
   type RemoteContextPreview,
 } from "./intelligence";
 import { OrganismRenderer, deriveOrganismState } from "./organism";
+import { CameraAssist } from "./orb-sensor";
 import {
   PendingProposalGate,
   stagePendingProposal,
@@ -37,6 +57,7 @@ import { CircleLinkController } from "./peer";
 import { decodeInvite, encodeInviteCode, inviteLink, type BootstrapInvite, type OfferMode } from "./protocol";
 import {
   createQuest,
+  assertMemberCanOffer,
   deriveQuestLeg,
   deriveSharedReveal,
   latestQuest,
@@ -57,7 +78,9 @@ import {
 import { InviteScanner } from "./scanner";
 import {
   appendLocalEvent,
+  appendLocalEventExpectedRoot,
   appendLocalEventWithGroupUpdate,
+  canonicalGroupDigest,
   createCircleDraft,
   eventRoot,
   getCircle,
@@ -121,6 +144,16 @@ function currentForm(event: Event): HTMLFormElement {
 
 type OrbUserSource = "typed" | "voice" | "touch" | "keyboard";
 
+interface VerifiedAgentPreview {
+  proposal: QuestMasterProposal;
+  exactOutput: string;
+  questMaster?: AgentCellResult;
+  questSafety?: AgentCellResult;
+  safety?: QuestSafetyDecision;
+  safetyOutput?: string;
+  fallbackReason?: string;
+}
+
 export class RappHeirApp {
   readonly #root: HTMLElement;
   #database: ReplicaDatabase | undefined;
@@ -139,21 +172,18 @@ export class RappHeirApp {
   #aiDraft = "";
   #aiVoice = "";
   #aiStreaming = false;
+  #aiRequestSent = false;
   #aiUiGeneration = 0;
   #aiVoicePlayback = new AiVoicePlaybackGate();
-  #cameraAssist:
-    | {
-        enabled: boolean;
-        enable(
-          video: HTMLVideoElement,
-          onHighlight: (highlight: {
-            direction: "left" | "right" | "up" | "down" | "center";
-            armed: boolean;
-          }) => void,
-        ): Promise<{ enabled: boolean; reason?: "unsupported" | "unavailable" }>;
-        disable(): void;
-      }
-    | undefined;
+  #agentCell: AgentCellClient | undefined;
+  #agentPreview: VerifiedAgentPreview | undefined;
+  #agentRunning = false;
+  #agentUiGeneration = 0;
+  #agentAbort: AbortController | undefined;
+  #cameraAssist: CameraAssist | undefined;
+  #cameraEnableGeneration = 0;
+  #cameraEnableQueue: Promise<void> = Promise.resolve();
+  #orbShortcutMode = false;
   #scanner = new InviteScanner();
   #link: CircleLinkController | undefined;
   #invite: BootstrapInvite | undefined;
@@ -166,6 +196,7 @@ export class RappHeirApp {
   #reunionApprovals: ReunionApproval[] = [];
   #organismRenderer: OrganismRenderer | undefined;
   #renderNumber = 0;
+  #routeGeneration = 0;
   #lastRoutePath = "";
   #focusAfterRender = "";
   #talkCleanup: (() => void) | undefined;
@@ -224,22 +255,60 @@ export class RappHeirApp {
     this.#pendingReunion = undefined;
   }
 
-  #disposeRouteState(): void {
-    this.#scanner.stop();
-    this.#voice.stopAll();
-    this.#talkCleanup?.();
-    this.#talkCleanup = undefined;
-    this.#cameraAssist?.disable();
-    this.#intelligence.cancelDeviceLogin();
-    this.#intelligence.abortChat();
-    this.#loginUiGeneration += 1;
+  #clearAiState(): { requestMayHaveBeenSent: boolean } {
+    const requestMayHaveBeenSent = this.#aiRequestSent;
     this.#aiUiGeneration += 1;
-    this.#deviceCode = undefined;
+    this.#intelligence.abortChat();
+    this.#voice.stopSpeaking();
     this.#aiPreview = undefined;
     this.#aiDraft = "";
     this.#aiVoice = "";
     this.#aiStreaming = false;
+    this.#aiRequestSent = false;
+    return { requestMayHaveBeenSent };
+  }
+
+  #clearAgentState(teardown = true): void {
+    this.#agentUiGeneration += 1;
+    this.#agentAbort?.abort();
+    this.#agentAbort = undefined;
+    this.#agentRunning = false;
+    this.#agentPreview = undefined;
+    if (teardown) {
+      this.#agentCell?.teardown();
+      this.#agentCell = undefined;
+    }
+  }
+
+  #invalidateCamera(): void {
+    this.#cameraEnableGeneration += 1;
+    this.#cameraAssist?.disable();
+    const video = document.querySelector<HTMLVideoElement>("#orb-camera-preview");
+    if (video) video.hidden = true;
+  }
+
+  #playReservationIsCurrent(groupId: string, routeGeneration: number): boolean {
+    return (
+      routeGeneration === this.#routeGeneration &&
+      routeParts().path === `/play/${groupId}`
+    );
+  }
+
+  #disposeRouteState(): void {
+    this.#routeGeneration += 1;
+    this.#scanner.stop();
+    this.#voice.stopAll();
+    this.#voiceOutput = "";
+    this.#talkCleanup?.();
+    this.#talkCleanup = undefined;
+    this.#invalidateCamera();
+    this.#intelligence.cancelDeviceLogin();
+    this.#loginUiGeneration += 1;
+    this.#deviceCode = undefined;
+    this.#clearAiState();
+    this.#clearAgentState();
     this.#proposalGate.cancel();
+    this.#orbShortcutMode = false;
     this.#orbState = createAdaptiveOrbState({ signedIn: this.#intelligence.authenticated });
     this.#clearLinkState();
     if (this.#lastRoutePath.startsWith("/reunion/")) {
@@ -259,7 +328,7 @@ export class RappHeirApp {
     const previousFocusId = routeChanged ? "" : (document.activeElement as HTMLElement | null)?.id ?? "";
     this.#talkCleanup?.();
     this.#talkCleanup = undefined;
-    this.#cameraAssist?.disable();
+    this.#invalidateCamera();
     this.#organismRenderer?.destroy();
     this.#organismRenderer = undefined;
     let content = "";
@@ -303,7 +372,11 @@ export class RappHeirApp {
       <main id="main" tabindex="-1">${content}</main>
       <div id="live-status" class="live-status" role="status" aria-live="polite">${escapeHtml(this.#status)}</div>
       <div id="alert-status" class="sr-only" role="alert" aria-live="assertive">${escapeHtml(alert)}</div>
-      <footer><p>Local-first • no ambient microphone • PeerJS IDs are transport addresses, not identity</p></footer>
+      <footer><p>Local-first • no ambient microphone • PeerJS IDs are transport addresses, not identity</p>
+        <p><a href="${import.meta.env.BASE_URL}NOTICE.md">Notices</a> •
+        <a href="${import.meta.env.BASE_URL}PRIVACY.md">Privacy</a> •
+        <a href="${import.meta.env.BASE_URL}SECURITY.md">Security</a> •
+        <a href="${import.meta.env.BASE_URL}PROTOCOL.md">Protocol</a></p></footer>
     `;
     this.#alert = "";
     this.#bind(route);
@@ -334,7 +407,7 @@ export class RappHeirApp {
               <option>steady</option><option>wild</option><option>wry</option>
             </select>
           </label>
-          <label>Voice seed <input name="voiceSeed" maxlength="48" pattern="[\\w -]{1,48}" required placeholder="two quiet words"></label>
+          <label>Voice seed <input name="voiceSeed" maxlength="48" pattern="[A-Za-z0-9_ \\-]{1,48}" required placeholder="two quiet words"></label>
           <button class="button primary wide" type="submit">Create companion on this device</button>
         </form>
         <details class="trust-note">
@@ -591,7 +664,8 @@ export class RappHeirApp {
       signedIn: this.#intelligence.authenticated,
     });
     const selected = highlightedPetal(this.#orbState);
-    const pending = this.#proposalGate.pending;
+    const pendingCandidate = this.#proposalGate.pending;
+    const pending = pendingCandidate?.circleId === groupId ? pendingCandidate : undefined;
     const tunnel = this.#orbState.breadcrumb.at(-1);
     let leg = "";
     if (quest) {
@@ -621,7 +695,11 @@ export class RappHeirApp {
       .join("");
     const pendingCard = pending
       ? `<section class="proposal-card" aria-labelledby="proposal-title">
-          <p class="eyebrow">Frozen local proposal • no event yet</p>
+          <p class="eyebrow">${
+            this.#proposalGate.committing
+              ? "Atomic signing has begun"
+              : "Frozen local proposal • no event yet"
+          }</p>
           <h2 id="proposal-title" tabindex="-1">Review &amp; sign</h2>
           <p>${escapeHtml(pending.preview)}</p>
           <dl>
@@ -636,9 +714,15 @@ export class RappHeirApp {
           sanitizes the exact payload, then creates at most one signed event. Highlighting never signs.</p>
           <div class="button-row">
             <button id="review-sign-proposal" class="button primary" type="button" ${
-              pending.expiresAt <= Date.now() ? "disabled" : ""
-            }>Review &amp; sign this exact proposal</button>
-            <button id="cancel-proposal" class="button quiet" type="button">Cancel — create zero events</button>
+              pending.expiresAt <= Date.now() || this.#proposalGate.signing ? "disabled" : ""
+            }>${this.#proposalGate.committing ? "Signing atomically…" : "Review &amp; sign this exact proposal"}</button>
+            <button id="cancel-proposal" class="button quiet" type="button" ${
+              this.#proposalGate.committing ? "disabled" : ""
+            }>${
+              this.#proposalGate.committing
+                ? "Signing cannot be cancelled"
+                : "Cancel — create zero events"
+            }</button>
           </div>
         </section>`
       : "";
@@ -677,7 +761,7 @@ export class RappHeirApp {
         : "";
     const devicePanel = this.#deviceCode
       ? `<section class="device-code-panel" aria-labelledby="device-code-title">
-          <h3 id="device-code-title">Connect GitHub Copilot</h3>
+          <h3 id="device-code-title" tabindex="-1">Connect GitHub Copilot</h3>
           <p>Sign-in sends no Circle content. Open GitHub and enter:</p>
           <strong class="device-code">${escapeHtml(this.#deviceCode.userCode)}</strong>
           <a class="button primary" href="${escapeHtml(
@@ -686,9 +770,74 @@ export class RappHeirApp {
           <button id="cancel-device-login" class="button quiet" type="button">Cancel sign-in</button>
         </section>`
       : "";
+    const agentPreviewCard = this.#agentPreview
+      ? `<section class="agent-preview-card" aria-labelledby="agent-preview-title">
+          <p class="eyebrow">${
+            this.#agentPreview.fallbackReason
+              ? "Deterministic JavaScript offline fallback"
+              : `Manifest + source verified • CPython via Pyodide ${PYODIDE_VERSION}`
+          }</p>
+          <h3 id="agent-preview-title" tabindex="-1">Exact quest-agent output</h3>
+          ${
+            this.#agentPreview.fallbackReason
+              ? `<p class="network-warning">The verified Python path was unavailable or failed validation, so no Python claim is made.
+                The existing deterministic JavaScript quest generator was used instead: ${escapeHtml(
+                  this.#agentPreview.fallbackReason,
+                )}</p>`
+              : `<dl><div><dt>Manifest</dt><dd><code>${PINNED_AGENT_MANIFEST_HASH}</code></dd></div>
+                <div><dt>QuestMaster source</dt><dd><code>${escapeHtml(
+                  this.#agentPreview.questMaster?.sourceHash ?? "",
+                )}</code></dd></div>
+                ${
+                  this.#agentPreview.questSafety
+                    ? `<div><dt>QuestSafety source</dt><dd><code>${escapeHtml(
+                        this.#agentPreview.questSafety.sourceHash,
+                      )}</code></dd></div>`
+                    : ""
+                }</dl>`
+          }
+          <pre>${escapeHtml(this.#agentPreview.exactOutput)}</pre>
+          ${
+            this.#agentPreview.safetyOutput
+              ? `<details><summary>Exact QuestSafety output</summary><pre>${escapeHtml(
+                  this.#agentPreview.safetyOutput,
+                )}</pre></details>`
+              : ""
+          }
+          <p class="fine">The output is inert untrusted data. Staging parses bounded quest fields into the normal
+          PendingProposal gate; only your later Review &amp; sign turn can create an event.</p>
+          <button id="stage-agent-quest" class="button primary" type="button">Stage this quest for Review &amp; sign</button>
+        </section>`
+      : "";
     const mindTunnel =
       this.#orbState.mode === "tunnel" && tunnel === "Mind"
-        ? `<section class="mind-panel card">
+        ? `<section class="mind-panel card" aria-labelledby="verified-agents-title">
+            <p class="eyebrow">Tunnel • local verified bytecode</p>
+            <h2 id="verified-agents-title">Verified local RAPP agents</h2>
+            <p>QuestMaster runs as hash-pinned Python in CPython/Pyodide ${PYODIDE_VERSION}, inside an opaque-origin
+            <code>sandbox="allow-scripts"</code> iframe and its worker. The cell receives no signing key, storage,
+            DOM, PeerJS, Copilot, or host capability. It can propose a quest only.</p>
+            <p class="fine">First use needs network access to the exact pinned raw GitHub commit and pinned Pyodide
+            files. Browser HTTP caching may help later, but availability and retention are not guaranteed; the
+            service worker deliberately does not cache either origin.</p>
+            <form id="verified-agent-form" class="form-grid">
+              <label>Place class <select name="context">
+                <option>indoors</option><option>doorstep</option><option>park</option><option>street</option>
+                <option>transit</option><option>waterside</option><option>unknown</option>
+              </select></label>
+              <label>Weather band <select name="weather">
+                <option>clear</option><option>clouded</option><option>rain</option><option>snow</option>
+                <option>wind</option><option>warm</option><option>cold</option><option>unknown</option>
+              </select></label>
+              <label class="check"><input name="safety" type="checkbox" checked>
+                Also verify the parsed proposal with hash-pinned QuestSafety</label>
+              <button class="button primary" type="submit" ${this.#agentRunning ? "disabled" : ""}>${
+                this.#agentRunning ? "Loading verified CPython cell…" : "Run hash-pinned QuestMaster"
+              }</button>
+            </form>
+            ${agentPreviewCard}
+          </section>
+          <section class="mind-panel card">
             <p class="eyebrow">Tunnel • optional remote mind</p>
             <h2>Copilot narrator/planner</h2>
             <p>Offline quest templates remain authoritative and available. Copilot has no event, signing, storage,
@@ -727,7 +876,7 @@ export class RappHeirApp {
         ? `<section class="ai-draft-card" aria-labelledby="ai-draft-title">
             <p class="eyebrow">Remote Copilot mode • untrusted draft</p>
             <h2 id="ai-draft-title">Narrator draft</h2>
-            <output id="ai-draft-output" aria-live="polite">${escapeHtml(
+            <output id="ai-draft-output" tabindex="-1">${escapeHtml(
               this.#aiDraft ||
                 (this.#aiStreaming
                   ? "Streaming an untrusted draft…"
@@ -768,12 +917,13 @@ export class RappHeirApp {
         <nav class="orb-breadcrumb" aria-label="Adaptive Orb mode">${this.#orbState.breadcrumb
           .map((item) => `<span>${escapeHtml(item)}</span>`)
           .join("<span aria-hidden=\"true\">›</span>")}</nav>
-        <section class="adaptive-orb" style="--orb-hue:${organism?.hue ?? 265};--orb-glow:${(
+        <section class="adaptive-orb" tabindex="-1" data-orb-shortcut-surface
+          aria-label="Adaptive Orb keyboard background" style="--orb-hue:${organism?.hue ?? 265};--orb-glow:${(
           0.1 +
           (organism?.aura ?? 0.5) * 0.18
         ).toFixed(3)};--orb-breath:${(6.4 - (organism?.motion ?? 0.5) * 2).toFixed(
           2,
-        )}s" aria-label="Adaptive Orb actions">
+        )}s">
           <button id="orb-center" class="orb-center" type="button" aria-label="Center: cancel current draft and rest safely">
             <span class="orb-core" aria-hidden="true"><i></i><i></i><i></i></span>
             <strong>Center</strong><small>safe cancel / rest</small>
@@ -798,8 +948,8 @@ export class RappHeirApp {
         </section>
         <section class="input-parity card">
           <h2>Message or command</h2>
-          <p class="network-warning"><strong>Browser speech warning:</strong> recognition may use your browser or
-          operating-system network service even when local processing is requested. No raw audio is kept by Rapp Heir.</p>
+          <p class="network-warning"><strong>Browser speech warning:</strong> SpeechRecognition and SpeechSynthesis
+          may use platform, browser, or vendor services, including network services. No raw audio is kept by Rapp Heir.</p>
           <div class="voice-command-row">
             <button id="push-to-talk" class="talk-button" aria-describedby="talk-help" aria-pressed="false">
               <span aria-hidden="true">◉</span><strong>Hold or toggle to speak</strong>
@@ -856,8 +1006,11 @@ export class RappHeirApp {
           <video id="orb-camera-preview" class="camera-preview" muted playsinline hidden></video>
           <p class="fine">No pixels, vectors, direction history, or camera output are stored, logged, networked, AI-sent, or exported.</p>
         </section>
-        <p class="keyboard-help">Keyboard: ←/→ rotate highlight, Enter confirms, Escape centers, U/Backspace undo,
-        R repeats, and Space toggles push-to-talk outside controls.</p>
+        <p class="keyboard-help">When body or the Orb background owns focus: ←/→ rotates highlight, Enter confirms,
+        Escape centers, U/Backspace undoes, and R repeats. Space push-to-talk works only after explicit shortcut mode.</p>
+        <button id="toggle-orb-shortcuts" class="button quiet" type="button" aria-pressed="${
+          this.#orbShortcutMode
+        }">${this.#orbShortcutMode ? "Disable" : "Enable"} Orb keyboard shortcut mode</button>
         <a class="button quiet" href="#/circle/${escapeHtml(group.id)}">Back to organism</a>
       </section>`;
   }
@@ -1173,15 +1326,19 @@ export class RappHeirApp {
         this.#disableCameraAssist();
       };
       globalKeyDown = (event: KeyboardEvent): void => {
-        if (event.repeat || shouldIgnoreOrbShortcut(event.target)) return;
+        if (
+          event.repeat ||
+          shouldIgnoreOrbShortcut(event.target) ||
+          !orbShortcutSurfaceOwnsFocus(event.target)
+        ) return;
         if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
           event.preventDefault();
           this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: -1 });
-          this.#paintOrbHighlight();
+          this.#paintOrbHighlight("", true);
         } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
           event.preventDefault();
           this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: 1 });
-          this.#paintOrbHighlight();
+          this.#paintOrbHighlight("", true);
         } else if (event.key === "Enter") {
           event.preventDefault();
           void this.#activateHighlighted("keyboard");
@@ -1194,7 +1351,7 @@ export class RappHeirApp {
         } else if (event.key.toLocaleLowerCase() === "r") {
           event.preventDefault();
           void this.#handleOrbInput("repeat", "keyboard");
-        } else if (event.code === "Space") {
+        } else if (event.code === "Space" && this.#orbShortcutMode) {
           event.preventDefault();
           if (talk.getAttribute("aria-pressed") === "true") {
             this.#voice.abortListening();
@@ -1243,11 +1400,11 @@ export class RappHeirApp {
         if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
           event.preventDefault();
           this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: -1 });
-          this.#paintOrbHighlight();
+          this.#paintOrbHighlight("", true);
         } else if (event.key === "ArrowRight" || event.key === "ArrowDown") {
           event.preventDefault();
           this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "rotate", delta: 1 });
-          this.#paintOrbHighlight();
+          this.#paintOrbHighlight("", true);
         } else if (event.key === "Enter") {
           event.preventDefault();
           this.#orbState = adaptiveOrbReducer(this.#orbState, {
@@ -1318,6 +1475,23 @@ export class RappHeirApp {
       void this.render();
     });
     document.querySelector("#mind-logout")?.addEventListener("click", () => void this.#logoutMind());
+    document
+      .querySelector<HTMLFormElement>("#verified-agent-form")
+      ?.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const form = currentForm(event);
+        void this.#runVerifiedQuestAgent(
+          groupId,
+          fieldValue(form, "context"),
+          fieldValue(form, "weather"),
+          (form.elements.namedItem("safety") as HTMLInputElement).checked,
+        );
+      });
+    document.querySelector("#stage-agent-quest")?.addEventListener("click", () => {
+      this.#runOrbTask(
+        this.#stageVerifiedAgentQuest(groupId, this.#nextUserTurn()),
+      );
+    });
     document.querySelector<HTMLFormElement>("#ai-draft-form")?.addEventListener("submit", (event) => {
       event.preventDefault();
       this.#runOrbTask(
@@ -1328,14 +1502,15 @@ export class RappHeirApp {
       .querySelector("#approve-ai-preview")
       ?.addEventListener("click", () => void this.#sendApprovedAiPreview());
     document.querySelector("#cancel-ai-preview")?.addEventListener("click", () => {
-      this.#aiPreview = undefined;
-      this.#aiVoice = "";
-      this.#aiUiGeneration += 1;
-      this.#intelligence.abortChat();
+      const ai = this.#clearAiState();
       this.#loginUiGeneration += 1;
       this.#intelligence.cancelDeviceLogin();
       this.#deviceCode = undefined;
-      this.#setStatus("Remote context preview cancelled; zero bytes were sent.");
+      this.#setStatus(
+        ai.requestMayHaveBeenSent
+          ? "Remote request cancelled. Context bytes had already been sent; no Circle event was created."
+          : "Remote context preview cancelled before its bytes were sent.",
+      );
       void this.render();
     });
     document
@@ -1347,6 +1522,18 @@ export class RappHeirApp {
     document
       .querySelector("#disable-camera-assist")
       ?.addEventListener("click", () => this.#disableCameraAssist(true));
+    document.querySelector("#toggle-orb-shortcuts")?.addEventListener("click", () => {
+      this.#orbShortcutMode = !this.#orbShortcutMode;
+      const surface = document.querySelector<HTMLElement>("[data-orb-shortcut-surface]");
+      surface?.focus();
+      this.#setStatus(
+        this.#orbShortcutMode
+          ? "Orb shortcut mode enabled. Space may now toggle push-to-talk while the Orb background owns focus."
+          : "Orb shortcut mode disabled. Native keyboard behavior is preserved.",
+      );
+      this.#focusAfterRender = "[data-orb-shortcut-surface]";
+      void this.render();
+    });
   }
 
   #bindReunion(route: ReturnType<typeof routeParts>): void {
@@ -1626,20 +1813,26 @@ export class RappHeirApp {
   }
 
   #runOrbTask(task: Promise<void>): void {
-    void task.catch((error: unknown) => this.#setAlert(this.#error(error)));
+    void task.catch((error: unknown) => {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      this.#setAlert(this.#error(error));
+    });
   }
 
   #proposalOrigin(source: OrbUserSource): ProposalOrigin {
     return source === "typed" ? "typed" : source === "voice" ? "voice" : source;
   }
 
-  #paintOrbHighlight(extra = ""): void {
+  #paintOrbHighlight(extra = "", moveFocus = false): void {
     const selected = highlightedPetal(this.#orbState);
+    let selectedButton: HTMLButtonElement | undefined;
     document.querySelectorAll<HTMLButtonElement>("[data-orb-petal]").forEach((button) => {
       const highlighted = button.dataset.action === this.#orbState.highlighted;
       button.classList.toggle("highlighted", highlighted);
       button.setAttribute("aria-pressed", String(highlighted));
+      if (highlighted) selectedButton = button;
     });
+    if (moveFocus) selectedButton?.focus();
     const status = document.querySelector<HTMLElement>("#orb-highlight");
     if (status) {
       status.textContent = `Highlighted: ${
@@ -1711,32 +1904,42 @@ export class RappHeirApp {
         await this.render();
       }
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       this.#setAlert(this.#error(error));
     }
   }
 
   async #cancelOrb(): Promise<void> {
-    this.#proposalGate.cancel();
-    this.#aiPreview = undefined;
-    this.#aiVoice = "";
-    this.#aiUiGeneration += 1;
-    this.#intelligence.abortChat();
+    const proposalCancellation = this.#proposalGate.cancel();
+    if (proposalCancellation.commitStarted) {
+      this.#voiceOutput =
+        "Atomic signing already began. Cancellation cannot promise zero events; wait for the result.";
+      this.#setStatus(this.#voiceOutput);
+      await this.render();
+      return;
+    }
+    const ai = this.#clearAiState();
+    this.#clearAgentState();
     this.#loginUiGeneration += 1;
     this.#intelligence.cancelDeviceLogin();
     this.#deviceCode = undefined;
     this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "cancel" });
-    this.#voiceOutput = "Centered safely. Drafts were cancelled and zero events were created.";
+    this.#voiceOutput = ai.requestMayHaveBeenSent
+      ? "Centered safely. The remote request was aborted but bytes had already been sent; drafts were cleared and zero Circle events were created."
+      : "Centered safely. Drafts were cancelled and zero Circle events were created.";
     this.#focusAfterRender = "#orb-center";
     this.#setStatus(this.#voiceOutput);
     await this.render();
   }
 
   async #undoOrb(): Promise<void> {
-    this.#proposalGate.cancel();
-    this.#aiPreview = undefined;
-    this.#aiVoice = "";
-    this.#aiUiGeneration += 1;
-    this.#intelligence.abortChat();
+    const proposalCancellation = this.#proposalGate.cancel();
+    if (proposalCancellation.commitStarted) {
+      this.#setStatus("Atomic signing already began; undo cannot cancel that commit.");
+      return;
+    }
+    this.#clearAiState();
+    this.#clearAgentState();
     this.#loginUiGeneration += 1;
     this.#intelligence.cancelDeviceLogin();
     this.#deviceCode = undefined;
@@ -1762,16 +1965,19 @@ export class RappHeirApp {
     try {
       if (intent.kind === "stop") {
         this.#voice.stopAll();
-        this.#aiUiGeneration += 1;
-        this.#intelligence.abortChat();
+        const ai = this.#clearAiState();
+        this.#clearAgentState();
         this.#loginUiGeneration += 1;
         this.#intelligence.cancelDeviceLogin();
         this.#deviceCode = undefined;
-        this.#aiStreaming = false;
-        this.#aiVoice = "";
         document.querySelector(".device-code-panel")?.remove();
         document.querySelector("#push-to-talk")?.setAttribute("aria-pressed", "false");
-        this.#setAlert("Stopped microphone, speech, and remote request. Stale callbacks are ignored.");
+        this.#setAlert(
+          ai.requestMayHaveBeenSent
+            ? "Stopped microphone, speech, and remote stream. Request bytes had already been sent; stale callbacks are ignored."
+            : "Stopped microphone, speech, and remote request before context bytes were sent. Stale callbacks are ignored.",
+        );
+        await this.render();
       } else if (intent.kind === "cancel") {
         await this.#cancelOrb();
       } else if (intent.kind === "undo") {
@@ -1835,6 +2041,7 @@ export class RappHeirApp {
         await this.#prepareAiPreview(groupId, intent.text);
       }
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       this.#setAlert(this.#error(error));
     }
   }
@@ -1843,6 +2050,12 @@ export class RappHeirApp {
     groupId: string,
     command: Extract<PocketCommand, { type: "turn" | "recap" | "help" | "repeat" }>,
   ): Promise<void> {
+    const routeGeneration = this.#routeGeneration;
+    const assertCurrent = (): void => {
+      if (!this.#playReservationIsCurrent(groupId, routeGeneration)) {
+        throw new DOMException("Caption request was cancelled", "AbortError");
+      }
+    };
     if (command.type === "repeat") {
       this.#voice.repeat();
       return;
@@ -1852,12 +2065,15 @@ export class RappHeirApp {
         "Try: my turn, new quest, offer…, rest, reveal, recap, sync, reunion, mind, confirm, cancel, undo, repeat, or stop.";
     } else if (command.type === "turn") {
       const events = await getCircleEvents(this.#db(), groupId);
+      assertCurrent();
       const quest = latestQuest(events);
       if (!quest) throw new Error("No quest yet. Highlight New Quest, then confirm.");
       const leg = await deriveQuestLeg(quest, this.#identityRequired().memberId, events);
+      assertCurrent();
       this.#voiceOutput = `${leg.role}, ${leg.minutes} minutes. ${leg.prompt}`;
     } else {
       const events = await getCircleEvents(this.#db(), groupId);
+      assertCurrent();
       const reveal = events
         .filter((event) => event.body.type === "quest.reveal")
         .sort(
@@ -1870,6 +2086,7 @@ export class RappHeirApp {
         ? String(reveal.body.payload.text)
         : "No signed shared reveal has arrived yet.";
     }
+    assertCurrent();
     this.#voice.speak(this.#voiceOutput);
     await this.render();
   }
@@ -1878,22 +2095,55 @@ export class RappHeirApp {
     group: CircleRecord;
     events: Awaited<ReturnType<typeof getCircleEvents>>;
     binding: ProposalBinding;
+  }>;
+  async #proposalState(
+    groupId: string,
+    assertCurrent: () => void,
+  ): Promise<{
+    group: CircleRecord;
+    events: Awaited<ReturnType<typeof getCircleEvents>>;
+    binding: ProposalBinding;
+  }>;
+  async #proposalState(
+    groupId: string,
+    assertCurrent: () => void = () => undefined,
+  ): Promise<{
+    group: CircleRecord;
+    events: Awaited<ReturnType<typeof getCircleEvents>>;
+    binding: ProposalBinding;
   }> {
     const [group, events] = await Promise.all([
       getCircle(this.#db(), groupId),
       getCircleEvents(this.#db(), groupId),
     ]);
+    assertCurrent();
     if (!group) throw new Error("Circle missing");
     const root = await eventRoot(events);
+    assertCurrent();
+    const stateDigest = await stateDigestForProposal(group, root);
+    assertCurrent();
     return {
       group,
       events,
       binding: {
         circleId: group.id,
         eventRoot: root,
-        stateDigest: await stateDigestForProposal(group, root),
+        stateDigest,
       },
     };
+  }
+
+  #assertStageCurrent(
+    groupId: string,
+    reservation: number,
+    routeGeneration: number,
+  ): void {
+    if (
+      !this.#proposalGate.stageReservationIsCurrent(reservation) ||
+      !this.#playReservationIsCurrent(groupId, routeGeneration)
+    ) {
+      throw new DOMException("Proposal staging was cancelled", "AbortError");
+    }
   }
 
   async #stageEventProposal(
@@ -1904,10 +2154,10 @@ export class RappHeirApp {
     preview: string,
     origin: ProposalOrigin,
     originTurn: number,
+    reservation: number,
+    routeGeneration: number,
   ): Promise<void> {
-    if (this.#proposalGate.pending) {
-      throw new Error("Cancel or confirm the current proposal before staging another");
-    }
+    this.#assertStageCurrent(binding.circleId, reservation, routeGeneration);
     const proposal = await stagePendingProposal({
       binding,
       authorMemberId,
@@ -1917,7 +2167,8 @@ export class RappHeirApp {
       origin,
       originTurn,
     });
-    this.#proposalGate.stage(proposal);
+    this.#assertStageCurrent(binding.circleId, reservation, routeGeneration);
+    this.#proposalGate.stage(proposal, reservation);
     this.#orbState = adaptiveOrbReducer(this.#orbState, {
       type: "enter",
       mode: "compass",
@@ -1935,13 +2186,20 @@ export class RappHeirApp {
     origin: ProposalOrigin,
     turn: number,
   ): Promise<void> {
-    const { group, events, binding } = await this.#proposalState(groupId);
+    const reservation = this.#proposalGate.reserveStage();
+    const routeGeneration = this.#routeGeneration;
+    const context = form ? fieldValue(form, "context") : "unknown";
+    const weather = form ? fieldValue(form, "weather") : "unknown";
+    const assertCurrent = (): void =>
+      this.#assertStageCurrent(groupId, reservation, routeGeneration);
+    const { group, events, binding } = await this.#proposalState(groupId, assertCurrent);
     const quest = await createQuest(
       group,
       events,
-      form ? fieldValue(form, "context") : "unknown",
-      form ? fieldValue(form, "weather") : "unknown",
+      context,
+      weather,
     );
+    assertCurrent();
     await this.#stageEventProposal(
       binding,
       this.#identityRequired().memberId,
@@ -1950,6 +2208,8 @@ export class RappHeirApp {
       `Create offline quest “${quest.title}” with ${quest.contextClass}/${quest.weatherBand} context.`,
       origin,
       turn,
+      reservation,
+      routeGeneration,
     );
   }
 
@@ -1960,38 +2220,35 @@ export class RappHeirApp {
     origin: ProposalOrigin,
     turn: number,
   ): Promise<void> {
-    const { group, events, binding } = await this.#proposalState(groupId);
+    const reservation = this.#proposalGate.reserveStage();
+    const routeGeneration = this.#routeGeneration;
+    const formValues = form
+      ? {
+          text: fieldValue(form, "text"),
+          choice: fieldValue(form, "choice"),
+          trait: fieldValue(form, "trait") || undefined,
+          includeContext: (form.elements.namedItem("context") as HTMLInputElement).checked,
+          approved: (form.elements.namedItem("approved") as HTMLInputElement).checked,
+        }
+      : undefined;
+    const assertCurrent = (): void =>
+      this.#assertStageCurrent(groupId, reservation, routeGeneration);
+    const { group, events, binding } = await this.#proposalState(groupId, assertCurrent);
     const quest = latestQuest(events);
     if (!quest) throw new Error("Begin a quest first");
     const memberId = this.#identityRequired().memberId;
-    if (
-      events.some(
-        (event) =>
-          event.body.type === "quest.offering" &&
-          event.body.payload.questId === quest.questId &&
-          event.body.memberId === memberId,
-      )
-    ) {
-      throw new Error("This companion has already offered to this quest");
-    }
+    assertMemberCanOffer(events, quest.questId, memberId);
     const offering = sanitizeOffering(
       {
         questId: quest.questId,
         memberId,
-        text: commandText ?? (form ? fieldValue(form, "text") : ""),
+        text: commandText ?? formValues?.text ?? "",
         choice: commandText
           ? "carry the spoken thread"
-          : form
-            ? fieldValue(form, "choice")
-            : "",
-        selectedTrait: form ? fieldValue(form, "trait") || undefined : undefined,
-        contextClass:
-          form && (form.elements.namedItem("context") as HTMLInputElement).checked
-            ? quest.contextClass
-            : undefined,
-        approvedForHeirloom: Boolean(
-          form && (form.elements.namedItem("approved") as HTMLInputElement).checked,
-        ),
+          : formValues?.choice ?? "",
+        selectedTrait: formValues?.trait,
+        contextClass: formValues?.includeContext ? quest.contextClass : undefined,
+        approvedForHeirloom: Boolean(formValues?.approved),
       },
       group,
     );
@@ -2003,6 +2260,8 @@ export class RappHeirApp {
       `Offer “${offering.text}” and leave choice “${offering.choice}”.`,
       origin,
       turn,
+      reservation,
+      routeGeneration,
     );
   }
 
@@ -2011,7 +2270,11 @@ export class RappHeirApp {
     origin: ProposalOrigin,
     turn: number,
   ): Promise<void> {
-    const { events, binding } = await this.#proposalState(groupId);
+    const reservation = this.#proposalGate.reserveStage();
+    const routeGeneration = this.#routeGeneration;
+    const assertCurrent = (): void =>
+      this.#assertStageCurrent(groupId, reservation, routeGeneration);
+    const { events, binding } = await this.#proposalState(groupId, assertCurrent);
     const quest = latestQuest(events);
     if (!quest) throw new Error("No quest is active");
     await this.#stageEventProposal(
@@ -2022,6 +2285,8 @@ export class RappHeirApp {
       "Rest this lobe without guilt, score, or streak.",
       origin,
       turn,
+      reservation,
+      routeGeneration,
     );
   }
 
@@ -2031,24 +2296,21 @@ export class RappHeirApp {
     approvedForHeirloom: boolean,
   ): Promise<void> {
     try {
+      const reservation = this.#proposalGate.reserveStage();
+      const routeGeneration = this.#routeGeneration;
+      const assertCurrent = (): void =>
+        this.#assertStageCurrent(groupId, reservation, routeGeneration);
       const [{ group, events, binding }, demo] = await Promise.all([
-        this.#proposalState(groupId),
+        this.#proposalState(groupId, assertCurrent),
         getDemoIdentity(this.#db(), groupId),
       ]);
+      assertCurrent();
       if (!group.demo || !demo) throw new Error("No practice companion");
       const quest = latestQuest(events);
       if (!quest) throw new Error("Begin a quest first");
-      if (
-        events.some(
-          (event) =>
-            event.body.type === "quest.offering" &&
-            event.body.payload.questId === quest.questId &&
-            event.body.memberId === demo.memberId,
-        )
-      ) {
-        throw new Error("Morrow already answered this quest");
-      }
+      assertMemberCanOffer(events, quest.questId, demo.memberId);
       const leg = await deriveQuestLeg(quest, demo.memberId, events);
+      assertCurrent();
       const offering = sanitizeOffering(
         {
           questId: quest.questId,
@@ -2068,8 +2330,11 @@ export class RappHeirApp {
         `Let simulated Morrow offer “${offering.text}” with its on-device demo key.`,
         "practice",
         turn,
+        reservation,
+        routeGeneration,
       );
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       this.#setAlert(this.#error(error));
     }
   }
@@ -2079,10 +2344,15 @@ export class RappHeirApp {
     origin: ProposalOrigin,
     turn: number,
   ): Promise<void> {
-    const { events, binding } = await this.#proposalState(groupId);
+    const reservation = this.#proposalGate.reserveStage();
+    const routeGeneration = this.#routeGeneration;
+    const assertCurrent = (): void =>
+      this.#assertStageCurrent(groupId, reservation, routeGeneration);
+    const { events, binding } = await this.#proposalState(groupId, assertCurrent);
     const quest = latestQuest(events);
     if (!quest) throw new Error("No quest is active");
     const reveal = await deriveSharedReveal(quest, events);
+    assertCurrent();
     await this.#stageEventProposal(
       binding,
       this.#identityRequired().memberId,
@@ -2098,6 +2368,8 @@ export class RappHeirApp {
       `Reveal the signed Braid from ${reveal.memberIds.length} distinct member offerings.`,
       origin,
       turn,
+      reservation,
+      routeGeneration,
     );
   }
 
@@ -2161,10 +2433,34 @@ export class RappHeirApp {
         memberOrder,
         roles,
       };
-      if (payload.promptSource !== "offline-template") {
-        throw new Error("Quest source must remain the reviewed offline template");
+      if (payload.promptSource === "offline-template") {
+        return { ...questPayload(quest), promptSource: "offline-template" };
       }
-      return { ...questPayload(quest), promptSource: "offline-template" };
+      const verification =
+        payload.agentVerification &&
+        typeof payload.agentVerification === "object" &&
+        !Array.isArray(payload.agentVerification)
+          ? (payload.agentVerification as Record<string, unknown>)
+          : {};
+      if (
+        payload.promptSource !== "verified-rapp-agent" ||
+        verification.agent !== "QuestMaster" ||
+        verification.manifestHash !== PINNED_AGENT_MANIFEST_HASH ||
+        verification.sourceHash !==
+          "5a155774b590d2127fda09b563fb04611b525082829b1da6c1ad7a0e28fd1e5d"
+      ) {
+        throw new Error("Quest source is not a hash-pinned reviewed agent");
+      }
+      return {
+        ...questPayload(quest),
+        promptSource: "verified-rapp-agent",
+        agentVerification: {
+          agent: "QuestMaster",
+          manifestHash: PINNED_AGENT_MANIFEST_HASH,
+          sourceHash:
+            "5a155774b590d2127fda09b563fb04611b525082829b1da6c1ad7a0e28fd1e5d",
+        },
+      };
     }
     if (eventType === "quest.offering") {
       const offering = sanitizeOffering(
@@ -2185,6 +2481,7 @@ export class RappHeirApp {
       if (!quest || quest.questId !== offering.questId) {
         throw new Error("Offering no longer targets the current quest");
       }
+      assertMemberCanOffer(events, quest.questId, proposal.authorMemberId);
       return offeringPayload(offering);
     }
     if (eventType === "quest.rest") {
@@ -2219,10 +2516,23 @@ export class RappHeirApp {
       this.#setAlert("There is no pending proposal to confirm.");
       return;
     }
+    const routeGeneration = this.#routeGeneration;
+    const assertCurrentRoute = (): void => {
+      if (
+        !this.#playReservationIsCurrent(pending.circleId, routeGeneration) ||
+        this.#proposalGate.pending?.id !== pending.id
+      ) {
+        throw new DOMException("Proposal confirmation was cancelled", "AbortError");
+      }
+    };
     try {
-      const { group, events, binding } = await this.#proposalState(pending.circleId);
+      const { group, events, binding } = await this.#proposalState(
+        pending.circleId,
+        assertCurrentRoute,
+      );
       const local = this.#identityRequired();
       const demo = group.demo ? await getDemoIdentity(this.#db(), group.id) : undefined;
+      assertCurrentRoute();
       const confirmed = await this.#proposalGate.confirm({
         binding,
         confirmingMemberId: local.memberId,
@@ -2236,22 +2546,44 @@ export class RappHeirApp {
         sanitize: (eventType, payload, proposal) =>
           this.#sanitizePendingPayload(group, events, eventType, payload, proposal),
         sign: async (eventType, payload, proposal) => {
-          const current = await this.#proposalState(group.id);
-          if (
-            current.binding.eventRoot !== proposal.binding.eventRoot ||
-            current.binding.stateDigest !== proposal.binding.stateDigest
-          ) {
-            throw new Error("Circle state changed before signing; review a fresh proposal");
-          }
           if (proposal.authorMemberId === local.memberId) {
-            await appendLocalEvent(this.#db(), group.id, local, eventType, payload);
+            await appendLocalEventExpectedRoot(
+              this.#db(),
+              group.id,
+              local,
+              eventType,
+              payload,
+              proposal.binding.eventRoot,
+            );
           } else if (group.demo && demo?.memberId === proposal.authorMemberId) {
-            await appendDemoEvent(this.#db(), group.id, eventType, payload);
+            await appendDemoEventExpectedRoot(
+              this.#db(),
+              group.id,
+              eventType,
+              payload,
+              proposal.binding.eventRoot,
+            );
           } else {
             throw new Error("Proposal signer is unavailable");
           }
         },
+        onCommitStart: () => {
+          const sign = document.querySelector<HTMLButtonElement>("#review-sign-proposal");
+          const cancel = document.querySelector<HTMLButtonElement>("#cancel-proposal");
+          if (sign) {
+            sign.disabled = true;
+            sign.textContent = "Signing atomically…";
+          }
+          if (cancel) {
+            cancel.disabled = true;
+            cancel.textContent = "Signing cannot be cancelled";
+          }
+          this.#setStatus(
+            "Atomic signing has begun. Cancel can no longer promise zero events.",
+          );
+        },
       });
+      if (!this.#playReservationIsCurrent(pending.circleId, routeGeneration)) return;
       this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "cancel" });
       this.#voiceOutput = `Signed exactly one ${confirmed.eventType} event. It is ready-not-sent.`;
       this.#focusAfterRender = "#orb-caption";
@@ -2260,6 +2592,7 @@ export class RappHeirApp {
       await this.render();
     } catch (error) {
       if (/state changed/iu.test(this.#error(error))) this.#proposalGate.cancel();
+      if (!this.#playReservationIsCurrent(pending.circleId, routeGeneration)) return;
       this.#setAlert(this.#error(error));
       await this.render();
     }
@@ -2270,10 +2603,13 @@ export class RappHeirApp {
     const generation = ++this.#loginUiGeneration;
     try {
       const session = await this.#intelligence.startDeviceLogin({
-        onStatus: (status) => this.#setStatus(status),
+        onStatus: (status) => {
+          if (generation === this.#loginUiGeneration) this.#setStatus(status);
+        },
       });
       if (generation !== this.#loginUiGeneration) return;
       this.#deviceCode = session.device;
+      this.#focusAfterRender = "#device-code-title";
       await this.render();
       void session.completion
         .then(async (result) => {
@@ -2299,13 +2635,244 @@ export class RappHeirApp {
     }
   }
 
+  async #runVerifiedQuestAgent(
+    groupId: string,
+    contextClass: string,
+    weatherBand: string,
+    runSafety: boolean,
+  ): Promise<void> {
+    this.#clearAgentState();
+    const generation = this.#agentUiGeneration;
+    const routeGeneration = this.#routeGeneration;
+    const controller = new AbortController();
+    this.#agentAbort = controller;
+    this.#agentRunning = true;
+    this.#setStatus(
+      `Loading pinned Pyodide ${PYODIDE_VERSION} and verifying the pinned RAPP manifest and source…`,
+    );
+    const assertCurrent = (): void => {
+      if (
+        generation !== this.#agentUiGeneration ||
+        controller.signal.aborted ||
+        !this.#playReservationIsCurrent(groupId, routeGeneration)
+      ) {
+        throw new DOMException("Verified agent run was cancelled", "AbortError");
+      }
+    };
+    let state:
+      | {
+          group: CircleRecord;
+          events: Awaited<ReturnType<typeof getCircleEvents>>;
+          binding: ProposalBinding;
+        }
+      | undefined;
+    try {
+      state = await this.#proposalState(groupId, assertCurrent);
+      const activeMembers = Object.values(state.group.members)
+        .filter((member) => member.active)
+        .sort((left, right) => left.memberId.localeCompare(right.memberId));
+      const client = new AgentCellClient();
+      this.#agentCell = client;
+      const questMaster = await client.runAgent(
+        "QuestMaster",
+        {
+          context_class: contextClass,
+          weather_band: weatherBand,
+          companion_traits: activeMembers.map((member) => member.companion.temperament),
+          history_summary: "",
+          member_count: activeMembers.length,
+        },
+        controller.signal,
+      );
+      assertCurrent();
+      const proposal = parseQuestMasterOutput(questMaster.output);
+      if (proposal.memberCount !== activeMembers.length) {
+        throw new Error("Verified QuestMaster changed the active member count");
+      }
+      let safety: QuestSafetyDecision | undefined;
+      let safetyOutput: string | undefined;
+      let questSafety: AgentCellResult | undefined;
+      if (runSafety) {
+        const candidate = questSafetyCandidate(proposal);
+        questSafety = await client.runAgent(
+          "QuestSafety",
+          {
+            candidate_text: candidate,
+            context_class: proposal.contextClass,
+          },
+          controller.signal,
+        );
+        assertCurrent();
+        safety = parseQuestSafetyOutput(questSafety.output);
+        safetyOutput = questSafety.output;
+        if (!safety.allowed || safety.safeText !== candidate) {
+          throw new Error(
+            `QuestSafety refused this proposal${
+              safety.reasons.length ? `: ${safety.reasons.join(", ")}` : ""
+            }`,
+          );
+        }
+      }
+      client.teardown();
+      if (this.#agentCell === client) this.#agentCell = undefined;
+      assertCurrent();
+      this.#agentPreview = {
+        proposal,
+        exactOutput: questMaster.output,
+        questMaster,
+        ...(questSafety ? { questSafety } : {}),
+        ...(safety ? { safety } : {}),
+        ...(safetyOutput ? { safetyOutput } : {}),
+      };
+      this.#agentRunning = false;
+      this.#agentAbort = undefined;
+      this.#focusAfterRender = "#agent-preview-title";
+      this.#setStatus(
+        "QuestMaster manifest and source hashes verified; CPython output is inert and ready for local review.",
+      );
+      await this.render();
+    } catch (error) {
+      if (
+        error instanceof DOMException &&
+        error.name === "AbortError"
+      ) return;
+      if (
+        generation !== this.#agentUiGeneration ||
+        !this.#playReservationIsCurrent(groupId, routeGeneration)
+      ) return;
+      this.#agentCell?.teardown();
+      this.#agentCell = undefined;
+      this.#agentRunning = false;
+      this.#agentAbort = undefined;
+      if (/^QuestSafety refused/u.test(this.#error(error))) {
+        this.#agentPreview = undefined;
+        this.#setAlert(`${this.#error(error)}. No proposal was staged.`);
+        await this.render();
+        return;
+      }
+      try {
+        state ??= await this.#proposalState(groupId, assertCurrent);
+        assertCurrent();
+        const quest = await createQuest(
+          state.group,
+          state.events,
+          contextClass,
+          weatherBand,
+        );
+        assertCurrent();
+        const activeCount = Object.values(state.group.members).filter(
+          (member) => member.active,
+        ).length;
+        const fallbackOutput = canonicalStringify({
+          title: quest.title,
+          premise: quest.premise,
+          context_class: quest.contextClass,
+          weather_band: quest.weatherBand,
+          minutes_per_leg: "5-10",
+          member_count: activeCount,
+          source: "deterministic-js-offline-fallback",
+        });
+        this.#agentPreview = {
+          proposal: {
+            title: quest.title,
+            premise: quest.premise,
+            contextClass: quest.contextClass,
+            weatherBand: quest.weatherBand,
+            minutesPerLeg: "5-10",
+            memberCount: activeCount,
+            source: "offline-bundled-agent",
+          },
+          exactOutput: fallbackOutput,
+          fallbackReason: this.#error(error).slice(0, 240),
+        };
+        this.#focusAfterRender = "#agent-preview-title";
+        this.#setStatus(
+          "The pinned Python path was unavailable or failed validation. The deterministic JavaScript fallback produced a local-only preview.",
+        );
+        await this.render();
+      } catch (fallbackError) {
+        if (
+          generation !== this.#agentUiGeneration ||
+          !this.#playReservationIsCurrent(groupId, routeGeneration)
+        ) return;
+        this.#setAlert(this.#error(fallbackError));
+      }
+    }
+  }
+
+  async #stageVerifiedAgentQuest(groupId: string, turn: number): Promise<void> {
+    const preview = this.#agentPreview;
+    if (!preview) throw new Error("Run QuestMaster and review its exact output first");
+    const reservation = this.#proposalGate.reserveStage();
+    const routeGeneration = this.#routeGeneration;
+    const assertCurrent = (): void =>
+      this.#assertStageCurrent(groupId, reservation, routeGeneration);
+    const { group, events, binding } = await this.#proposalState(groupId, assertCurrent);
+    const activeCount = Object.values(group.members).filter((member) => member.active).length;
+    if (preview.proposal.memberCount !== activeCount) {
+      throw new Error("Circle membership changed; run QuestMaster again");
+    }
+    const generated = await createQuest(
+      group,
+      events,
+      preview.proposal.contextClass,
+      preview.proposal.weatherBand,
+    );
+    assertCurrent();
+    const quest: Quest = {
+      ...generated,
+      title: preview.proposal.title,
+      premise: preview.proposal.premise,
+    };
+    const payload = preview.fallbackReason
+      ? { ...questPayload(quest), promptSource: "offline-template" }
+      : {
+          ...questPayload(quest),
+          promptSource: "verified-rapp-agent",
+          agentVerification: {
+            agent: "QuestMaster",
+            manifestHash: preview.questMaster?.manifestHash,
+            sourceHash: preview.questMaster?.sourceHash,
+          },
+        };
+    await this.#stageEventProposal(
+      binding,
+      this.#identityRequired().memberId,
+      "quest.created",
+      payload,
+      preview.fallbackReason
+        ? `Create deterministic fallback quest “${quest.title}”.`
+        : `Create hash-verified QuestMaster proposal “${quest.title}”.`,
+      preview.fallbackReason ? "touch" : "verified-agent",
+      turn,
+      reservation,
+      routeGeneration,
+    );
+  }
+
   async #prepareAiPreview(groupId: string, draft: string): Promise<void> {
-    const { group, events } = await this.#proposalState(groupId);
+    this.#clearAiState();
+    const generation = this.#aiUiGeneration;
+    const routeGeneration = this.#routeGeneration;
+    const assertCurrent = (): void => {
+      if (
+        generation !== this.#aiUiGeneration ||
+        !this.#playReservationIsCurrent(groupId, routeGeneration)
+      ) {
+        throw new DOMException("AI preview was cancelled", "AbortError");
+      }
+    };
+    this.#setStatus("Building a fresh bounded AI context preview locally…");
+    await this.render();
+    assertCurrent();
+    const { group, events } = await this.#proposalState(groupId, assertCurrent);
     const quest = latestQuest(events);
     const leg = quest
       ? await deriveQuestLeg(quest, this.#identityRequired().memberId, events)
       : undefined;
+    assertCurrent();
     const organism = group.genesis ? await deriveOrganismState(group, events) : undefined;
+    assertCurrent();
     this.#aiPreview = buildRemoteContextPreview({
       draft,
       quest: quest
@@ -2359,9 +2926,14 @@ export class RappHeirApp {
       this.#setAlert("Connect Copilot and build a context preview first.");
       return;
     }
+    const path = routeParts().path;
+    const groupId = path.startsWith("/play/") ? path.slice("/play/".length) : "";
+    const routeGeneration = this.#routeGeneration;
+    if (!groupId) return;
     this.#nextUserTurn();
     const generation = ++this.#aiUiGeneration;
     this.#aiStreaming = true;
+    this.#aiRequestSent = false;
     document
       .querySelector<HTMLButtonElement>("#approve-ai-preview")
       ?.setAttribute("disabled", "");
@@ -2371,23 +2943,44 @@ export class RappHeirApp {
     if (output) output.textContent = "Streaming an untrusted draft…";
     try {
       const approved = await approveRemoteContext(preview);
-      const result = await this.#intelligence.chat(approved, (fullText) => {
-        if (generation !== this.#aiUiGeneration) return;
-        const region = document.querySelector<HTMLElement>("#ai-draft-output");
-        if (region) region.textContent = fullText.slice(0, 2_000);
-      });
-      if (generation !== this.#aiUiGeneration) return;
+      if (
+        generation !== this.#aiUiGeneration ||
+        !this.#playReservationIsCurrent(groupId, routeGeneration)
+      ) return;
+      const result = await this.#intelligence.chat(
+        approved,
+        (fullText) => {
+          if (
+            generation !== this.#aiUiGeneration ||
+            !this.#playReservationIsCurrent(groupId, routeGeneration)
+          ) return;
+          const region = document.querySelector<HTMLElement>("#ai-draft-output");
+          if (region) region.textContent = fullText.slice(0, 2_000);
+        },
+        () => {
+          if (generation === this.#aiUiGeneration) this.#aiRequestSent = true;
+        },
+      );
+      if (
+        generation !== this.#aiUiGeneration ||
+        !this.#playReservationIsCurrent(groupId, routeGeneration)
+      ) return;
       this.#aiDraft = result.text;
       this.#aiVoice = result.voice;
       this.#aiStreaming = false;
+      this.#aiRequestSent = false;
       this.#aiPreview = undefined;
-      this.#voiceOutput = result.text;
-      this.#setStatus(
+      this.#voiceOutput = "Untrusted Copilot draft ready for review below.";
+      this.#status =
         result.voice
           ? "Untrusted Copilot display and spoken versions received. Neither entered the command parser or Circle log."
-          : "Untrusted Copilot display received. Spoken version unavailable; nothing was sent to speech.",
-      );
+          : "Untrusted Copilot display received. Spoken version unavailable; nothing was sent to speech.";
+      this.#focusAfterRender = "#ai-draft-output";
       await this.render();
+      if (
+        generation !== this.#aiUiGeneration ||
+        !this.#playReservationIsCurrent(groupId, routeGeneration)
+      ) return;
       this.#aiVoicePlayback.speakOnce(
         generation,
         this.#aiUiGeneration,
@@ -2397,6 +2990,7 @@ export class RappHeirApp {
     } catch (error) {
       if (generation !== this.#aiUiGeneration) return;
       this.#aiStreaming = false;
+      this.#aiRequestSent = false;
       document
         .querySelector<HTMLButtonElement>("#approve-ai-preview")
         ?.removeAttribute("disabled");
@@ -2406,18 +3000,24 @@ export class RappHeirApp {
 
   async #stageAiOffering(groupId: string, turn: number): Promise<void> {
     try {
-      if (!this.#aiDraft || this.#aiDraft.length > 600) {
+      const draft = this.#aiDraft;
+      if (!draft || draft.length > 600) {
         throw new Error("Copilot draft must be 1–600 characters to stage as an offering");
       }
-      const { group, events, binding } = await this.#proposalState(groupId);
+      const reservation = this.#proposalGate.reserveStage();
+      const routeGeneration = this.#routeGeneration;
+      const assertCurrent = (): void =>
+        this.#assertStageCurrent(groupId, reservation, routeGeneration);
+      const { group, events, binding } = await this.#proposalState(groupId, assertCurrent);
       const quest = latestQuest(events);
       if (!quest) throw new Error("Begin a quest before staging a Copilot offering");
       const memberId = this.#identityRequired().memberId;
+      assertMemberCanOffer(events, quest.questId, memberId);
       const offering = sanitizeOffering(
         {
           questId: quest.questId,
           memberId,
-          text: this.#aiDraft,
+          text: draft,
           choice: "carry the Copilot draft",
           approvedForHeirloom: false,
         },
@@ -2431,26 +3031,29 @@ export class RappHeirApp {
         `Stage the exact untrusted Copilot draft as an unselected offering: “${offering.text}”.`,
         "copilot-draft",
         turn,
+        reservation,
+        routeGeneration,
       );
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
       this.#setAlert(this.#error(error));
     }
   }
 
   async #logoutMind(): Promise<void> {
     this.#loginUiGeneration += 1;
-    this.#aiUiGeneration += 1;
     this.#intelligence.logout();
-    this.#proposalGate.cancel();
+    const proposalCancellation = this.#proposalGate.cancel();
     this.#voice.stopAll();
     this.#deviceCode = undefined;
-    this.#aiPreview = undefined;
-    this.#aiDraft = "";
-    this.#aiVoice = "";
-    this.#aiStreaming = false;
-    this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "cancel" });
-    this.#voiceOutput =
-      "Copilot logged out. Tokens, remote chat, proposals, and speech were cleared; local Circle identity remains.";
+    this.#clearAiState();
+    this.#clearAgentState();
+    if (!proposalCancellation.commitStarted) {
+      this.#orbState = adaptiveOrbReducer(this.#orbState, { type: "cancel" });
+    }
+    this.#voiceOutput = proposalCancellation.commitStarted
+      ? "Copilot logged out and remote state was cleared. Atomic Circle signing had already begun and continues."
+      : "Copilot logged out. Tokens, remote chat, proposals, and speech were cleared; local Circle identity remains.";
     this.#focusAfterRender = "#orb-center";
     this.#setStatus(this.#voiceOutput);
     await this.render();
@@ -2459,39 +3062,65 @@ export class RappHeirApp {
   async #enableCameraAssist(): Promise<void> {
     const video = document.querySelector<HTMLVideoElement>("#orb-camera-preview");
     if (!video) return;
-    try {
-      const { CameraAssist } = await import("./orb-sensor");
-      if (!routeParts().path.startsWith("/play/") || !video.isConnected) return;
+    const path = routeParts().path;
+    const generation = ++this.#cameraEnableGeneration;
+    const routeGeneration = this.#routeGeneration;
+    const run = this.#cameraEnableQueue.catch(() => undefined).then(async () => {
+      if (
+        generation !== this.#cameraEnableGeneration ||
+        routeGeneration !== this.#routeGeneration ||
+        routeParts().path !== path ||
+        !path.startsWith("/play/") ||
+        !video.isConnected
+      ) return;
       this.#cameraAssist ??= new CameraAssist();
-      const result = await this.#cameraAssist.enable(video, ({ direction, armed }) => {
-        this.#orbState = adaptiveOrbReducer(this.#orbState, {
-          type: "sensor-highlight",
-          direction,
+      try {
+        const result = await this.#cameraAssist.enable(video, ({ direction, armed }) => {
+          if (
+            generation !== this.#cameraEnableGeneration ||
+            routeGeneration !== this.#routeGeneration ||
+            routeParts().path !== path ||
+            !video.isConnected
+          ) return;
+          this.#orbState = adaptiveOrbReducer(this.#orbState, {
+            type: "sensor-highlight",
+            direction,
+          });
+          this.#paintOrbHighlight(
+            armed
+              ? "Camera dwell armed only the highlight; explicit confirmation is still required."
+              : "Camera changed highlight only.",
+          );
         });
-        this.#paintOrbHighlight(
-          armed
-            ? "Camera dwell armed only the highlight; explicit confirmation is still required."
-            : "Camera changed highlight only.",
+        if (
+          generation !== this.#cameraEnableGeneration ||
+          routeGeneration !== this.#routeGeneration ||
+          routeParts().path !== path ||
+          !video.isConnected
+        ) {
+          this.#cameraAssist.disable();
+          return;
+        }
+        video.hidden = !result.enabled;
+        this.#setStatus(
+          result.enabled
+            ? "Camera assist enabled locally. It can highlight only."
+            : result.reason === "unsupported"
+              ? "FaceDetector is unavailable; camera assist is disabled. All other controls still work."
+              : "Camera unavailable; all AI, voice, touch, and keyboard controls still work.",
         );
-      });
-      video.hidden = !result.enabled;
-      this.#setStatus(
-        result.enabled
-          ? "Camera assist enabled locally. It can highlight only."
-          : result.reason === "unsupported"
-            ? "FaceDetector is unavailable; camera assist is disabled. All other controls still work."
-            : "Camera unavailable; all AI, voice, touch, and keyboard controls still work.",
-      );
-    } catch {
-      video.hidden = true;
-      this.#setStatus("Camera assist could not start. All other controls still work.");
-    }
+      } catch {
+        if (generation !== this.#cameraEnableGeneration) return;
+        video.hidden = true;
+        this.#setStatus("Camera assist could not start. All other controls still work.");
+      }
+    });
+    this.#cameraEnableQueue = run;
+    await run;
   }
 
   #disableCameraAssist(announce = false): void {
-    this.#cameraAssist?.disable();
-    const video = document.querySelector<HTMLVideoElement>("#orb-camera-preview");
-    if (video) video.hidden = true;
+    this.#invalidateCamera();
     if (announce) this.#setStatus("Camera assist disabled and video tracks stopped.");
   }
 
@@ -2612,6 +3241,10 @@ export class RappHeirApp {
         "reunion.seal",
         payload,
         updatedGroup,
+        {
+          eventRoot: challenge.eventRoot,
+          groupDigest: canonicalGroupDigest(group),
+        },
       );
       this.#reunionChallenge = undefined;
       this.#reunionApprovals = [];
@@ -2631,6 +3264,10 @@ export class RappHeirApp {
         getCircleEvents(this.#db(), groupId),
       ]);
       if (!group) throw new Error("Circle missing");
+      const expected = {
+        eventRoot: await eventRoot(events),
+        groupDigest: canonicalGroupDigest(group),
+      };
       const artifact = await mintHeirloom(group, events);
       await verifyHeirloom(artifact);
       await appendLocalEventWithGroupUpdate(
@@ -2643,6 +3280,7 @@ export class RappHeirApp {
           selectedContributionCount: artifact.approvedStory.length,
         },
         { ...group, status: "heirloom-ready" },
+        expected,
       );
       downloadFile(
         `${group.name.toLowerCase().replace(/[^a-z0-9]+/gu, "-") || "circle"}.rapp-heir.json`,

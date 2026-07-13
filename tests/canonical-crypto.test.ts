@@ -4,6 +4,7 @@ import {
   canonicalStringify,
   fromBase64Url,
   sha256,
+  sha256Sync,
   toBase64Url,
 } from "../src/canonical";
 import {
@@ -35,6 +36,8 @@ describe("canonical signing and encryption", () => {
   it("produces stable canonical hashes", async () => {
     await expect(sha256({ b: 2, a: 1 })).resolves.toBe(await sha256({ a: 1, b: 2 }));
     await expect(sha256({ b: 3, a: 1 })).resolves.not.toBe(await sha256({ a: 1, b: 2 }));
+    expect(sha256Sync({ b: 2, a: 1 })).toBe(await sha256({ a: 1, b: 2 }));
+    expect(sha256Sync(new Uint8Array())).toBe(await sha256(new Uint8Array()));
   });
 
   it("signs and verifies canonical values", async () => {

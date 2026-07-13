@@ -12,6 +12,8 @@ import {
 } from "../src/intelligence";
 import {
   appendLocalEvent,
+  appendLocalEventExpectedRoot,
+  deleteReplicaDatabase,
   eventRoot,
   getCircleEvents,
   makeReplicaBundle,
@@ -158,6 +160,81 @@ describe("pending proposal authority gate", () => {
     expect(sign).not.toHaveBeenCalled();
   });
 
+  it("invalidates an in-flight stage reservation without overwriting a newer proposal", async () => {
+    const gate = new PendingProposalGate();
+    const firstReservation = gate.reserveStage();
+    const first = await proposal(1_000);
+    gate.cancel();
+    const secondReservation = gate.reserveStage();
+    const second = await proposal(2_000);
+    gate.stage(second, secondReservation);
+    expect(() => gate.stage(first, firstReservation)).toThrow(
+      /cancelled|newer pending/u,
+    );
+    expect(gate.pending?.id).toBe(second.id);
+  });
+
+  it("cancels during awaited authorization and creates zero events", async () => {
+    let release!: (allowed: boolean) => void;
+    const authorization = new Promise<boolean>((resolve) => {
+      release = resolve;
+    });
+    const sign = vi.fn<ConfirmProposalInput["sign"]>();
+    const gate = new PendingProposalGate();
+    gate.stage(await proposal());
+    const confirming = gate.confirm(
+      confirmation(sign, { authorize: () => authorization }),
+    );
+    await Promise.resolve();
+    expect(gate.cancel()).toEqual({ cancelled: true, commitStarted: false });
+    release(true);
+    await expect(confirming).rejects.toThrow("cancelled before commit");
+    expect(sign).not.toHaveBeenCalled();
+  });
+
+  it("rechecks expiry after awaited authorization", async () => {
+    let now = 2_000;
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sign = vi.fn<ConfirmProposalInput["sign"]>();
+    const gate = new PendingProposalGate();
+    const pending = await proposal();
+    gate.stage(pending);
+    const confirming = gate.confirm(
+      confirmation(sign, {
+        now: () => now,
+        authorize: async () => {
+          await wait;
+          return true;
+        },
+      }),
+    );
+    now = pending.expiresAt;
+    release();
+    await expect(confirming).rejects.toThrow("expired");
+    expect(sign).not.toHaveBeenCalled();
+  });
+
+  it("reports commit start as non-cancelable and still consumes one success", async () => {
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const gate = new PendingProposalGate();
+    gate.stage(await proposal());
+    const started = vi.fn();
+    const sign = vi.fn(async () => wait);
+    const confirming = gate.confirm(confirmation(sign, { onCommitStart: started }));
+    await vi.waitFor(() => expect(started).toHaveBeenCalledOnce());
+    expect(gate.cancel()).toEqual({ cancelled: false, commitStarted: true });
+    release();
+    await expect(confirming).resolves.toMatchObject({ eventType: "quest.rest" });
+    expect(sign).toHaveBeenCalledOnce();
+    expect(gate.pending).toBeUndefined();
+  });
+
   it("keeps the real signed log empty until the separate gate confirmation", async () => {
     const local = await identity("Proposal Local");
     const remote = await identity("Proposal Remote", 1);
@@ -258,5 +335,59 @@ describe("pending proposal authority gate", () => {
     expect(JSON.stringify(events)).not.toContain(voiceCanary);
     expect(JSON.stringify(replica)).not.toContain(voiceCanary);
     database.close();
+  });
+
+  it("lets only one of two same-root tab confirmations append atomically", async () => {
+    const local = await identity("Two Tab Local");
+    const remote = await identity("Two Tab Remote", 1);
+    const group = await groupFor([local, remote]);
+    const name = uniqueDatabaseName("two-tab-confirm");
+    const left = await openReplicaDatabase(name);
+    const right = await openReplicaDatabase(name);
+    await left.put("groups", group);
+    const root = await eventRoot([]);
+    const realBinding = {
+      circleId: group.id,
+      eventRoot: root,
+      stateDigest: await stateDigestForProposal(group, root),
+    };
+    const frozen = await stagePendingProposal({
+      binding: realBinding,
+      authorMemberId: local.memberId,
+      eventType: "quest.rest",
+      payload: { questId: "quest_same_root", reason: "rest-without-streak-or-penalty" },
+      preview: "Rest exactly once",
+      origin: "touch",
+      originTurn: 1,
+      now: 1_000,
+    });
+    const gates = [new PendingProposalGate(), new PendingProposalGate()];
+    gates.forEach((gate) => gate.stage(frozen));
+    const attempts = gates.map((gate, index) =>
+      gate.confirm({
+        binding: realBinding,
+        confirmingMemberId: local.memberId,
+        confirmationTurn: 2,
+        now: 2_000,
+        authorize: () => true,
+        sanitize: (_eventType, payload) => payload,
+        sign: (eventType, payload, candidate) =>
+          appendLocalEventExpectedRoot(
+            index === 0 ? left : right,
+            group.id,
+            local,
+            eventType,
+            payload,
+            candidate.binding.eventRoot,
+          ).then(() => undefined),
+      }),
+    );
+    const results = await Promise.allSettled(attempts);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    expect(await getCircleEvents(left, group.id)).toHaveLength(1);
+    left.close();
+    right.close();
+    await deleteReplicaDatabase(name);
   });
 });

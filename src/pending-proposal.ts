@@ -3,7 +3,14 @@ import { canonicalStringify, sha256, utf8 } from "./canonical";
 export const PROPOSAL_LIFETIME_MS = 5 * 60 * 1_000;
 export const MAX_PROPOSAL_PAYLOAD_BYTES = 16 * 1_024;
 
-export type ProposalOrigin = "typed" | "voice" | "touch" | "keyboard" | "copilot-draft" | "practice";
+export type ProposalOrigin =
+  | "typed"
+  | "voice"
+  | "touch"
+  | "keyboard"
+  | "copilot-draft"
+  | "verified-agent"
+  | "practice";
 
 export interface ProposalBinding {
   circleId: string;
@@ -101,7 +108,7 @@ export interface ConfirmProposalInput {
   binding: ProposalBinding;
   confirmingMemberId: string;
   confirmationTurn: number;
-  now?: number;
+  now?: number | (() => number);
   authorize: (proposal: PendingProposal, confirmingMemberId: string) => boolean | Promise<boolean>;
   sanitize: (
     eventType: string,
@@ -113,11 +120,19 @@ export interface ConfirmProposalInput {
     payload: Record<string, unknown>,
     proposal: PendingProposal,
   ) => void | Promise<void>;
+  onCommitStart?: (proposal: PendingProposal) => void;
+}
+
+export interface ProposalCancellation {
+  cancelled: boolean;
+  commitStarted: boolean;
 }
 
 export class PendingProposalGate {
   #pending: PendingProposal | undefined;
-  #signing = false;
+  #phase: "idle" | "validating" | "committing" = "idle";
+  #stageGeneration = 0;
+  #confirmationGeneration = 0;
   readonly #consumed = new Set<string>();
 
   get pending(): PendingProposal | undefined {
@@ -125,29 +140,67 @@ export class PendingProposalGate {
   }
 
   get signing(): boolean {
-    return this.#signing;
+    return this.#phase !== "idle";
   }
 
-  stage(proposal: PendingProposal): void {
-    if (this.#signing) throw new Error("A proposal is already being signed");
+  get committing(): boolean {
+    return this.#phase === "committing";
+  }
+
+  reserveStage(): number {
+    if (this.signing) throw new Error("A proposal is already being signed");
+    if (this.#pending) {
+      throw new Error("Cancel or confirm the current proposal before staging another");
+    }
+    this.#stageGeneration += 1;
+    return this.#stageGeneration;
+  }
+
+  stageReservationIsCurrent(reservation: number): boolean {
+    return (
+      Number.isSafeInteger(reservation) &&
+      reservation === this.#stageGeneration &&
+      !this.signing &&
+      !this.#pending
+    );
+  }
+
+  stage(proposal: PendingProposal, reservation?: number): void {
+    if (this.signing) throw new Error("A proposal is already being signed");
+    if (reservation !== undefined && reservation !== this.#stageGeneration) {
+      throw new Error("Proposal staging was cancelled before completion");
+    }
+    if (this.#pending) {
+      throw new Error("A newer pending proposal is already awaiting review");
+    }
+    if (reservation === undefined) this.#stageGeneration += 1;
     this.#pending = structuredClone(proposal);
   }
 
-  cancel(): void {
-    if (!this.#signing) this.#pending = undefined;
+  cancel(): ProposalCancellation {
+    if (this.#phase === "committing") {
+      return { cancelled: false, commitStarted: true };
+    }
+    this.#stageGeneration += 1;
+    this.#confirmationGeneration += 1;
+    this.#pending = undefined;
+    return { cancelled: true, commitStarted: false };
   }
 
   async confirm(input: ConfirmProposalInput): Promise<PendingProposal> {
     const proposal = this.#pending;
     if (!proposal) throw new Error("There is no pending proposal to confirm");
-    if (this.#signing || this.#consumed.has(proposal.id)) {
+    if (this.signing || this.#consumed.has(proposal.id)) {
       throw new Error("This proposal was already confirmed");
     }
     if (input.confirmationTurn <= proposal.originTurn) {
       throw new Error("Review the proposal, then confirm it in a separate turn");
     }
-    if ((input.now ?? Date.now()) >= proposal.expiresAt) {
+    const now = (): number =>
+      typeof input.now === "function" ? input.now() : input.now ?? Date.now();
+    if (now() >= proposal.expiresAt) {
       this.#pending = undefined;
+      this.#stageGeneration += 1;
       throw new Error("The proposal expired without creating an event");
     }
     if (
@@ -157,11 +210,29 @@ export class PendingProposalGate {
       input.binding.stateDigest !== proposal.binding.stateDigest
     ) {
       this.#pending = undefined;
+      this.#stageGeneration += 1;
       throw new Error("Circle state changed; review a fresh proposal");
     }
-    this.#signing = true;
+    this.#phase = "validating";
+    const confirmationGeneration = ++this.#confirmationGeneration;
+    const assertStillValid = (): void => {
+      if (
+        confirmationGeneration !== this.#confirmationGeneration ||
+        this.#pending?.id !== proposal.id
+      ) {
+        throw new Error("Proposal confirmation was cancelled before commit");
+      }
+      if (now() >= proposal.expiresAt) {
+        this.#pending = undefined;
+        this.#stageGeneration += 1;
+        this.#confirmationGeneration += 1;
+        throw new Error("The proposal expired without creating an event");
+      }
+    };
     try {
-      if (!(await input.authorize(proposal, input.confirmingMemberId))) {
+      const authorized = await input.authorize(proposal, input.confirmingMemberId);
+      assertStillValid();
+      if (!authorized) {
         throw new Error("This companion is not authorized to sign the proposal");
       }
       const parsed: unknown = JSON.parse(proposal.canonicalPayload);
@@ -173,15 +244,24 @@ export class PendingProposalGate {
         parsed as Record<string, unknown>,
         proposal,
       );
+      assertStillValid();
       if (canonicalStringify(sanitized) !== proposal.canonicalPayload) {
         throw new Error("Proposal payload changed during validation");
+      }
+      assertStillValid();
+      this.#phase = "committing";
+      try {
+        input.onCommitStart?.(structuredClone(proposal));
+      } catch {
+        // UI status must never prevent the already-started atomic commit.
       }
       await input.sign(proposal.eventType, sanitized, proposal);
       this.#consumed.add(proposal.id);
       this.#pending = undefined;
+      this.#stageGeneration += 1;
       return structuredClone(proposal);
     } finally {
-      this.#signing = false;
+      this.#phase = "idle";
     }
   }
 }

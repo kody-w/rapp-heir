@@ -1,11 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   adaptiveOrbReducer,
   createAdaptiveOrbState,
+  orbShortcutSurfaceOwnsFocus,
+  shouldIgnoreOrbShortcut,
   sourceCanActivate,
   STABLE_ORBIT_PETALS,
 } from "../src/adaptive-orb";
 import { parseOrbInput } from "../src/commands";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("Adaptive Orb pure controller", () => {
   it("keeps eight stable actions in native linear order", () => {
@@ -96,5 +102,46 @@ describe("Adaptive Orb pure controller", () => {
       "new-quest",
       "new-quest",
     ]);
+  });
+
+  it("preserves native controls and allows globals only from body or the Orb surface", () => {
+    class FakeElement {
+      constructor(
+        readonly blocked = false,
+        readonly surface = false,
+      ) {}
+
+      closest(selector: string): FakeElement | null {
+        expect(selector).toContain("summary");
+        expect(selector).toContain("h1");
+        expect(selector).toContain("[contenteditable]");
+        return this.blocked ? this : null;
+      }
+
+      matches(selector: string): boolean {
+        return this.surface && selector === "[data-orb-shortcut-surface]";
+      }
+    }
+    const body = new FakeElement();
+    const documentElement = new FakeElement();
+    vi.stubGlobal("Element", FakeElement);
+    vi.stubGlobal("document", { body, documentElement });
+    expect(
+      shouldIgnoreOrbShortcut(new FakeElement(true) as unknown as EventTarget),
+    ).toBe(true);
+    expect(
+      shouldIgnoreOrbShortcut(new FakeElement(false) as unknown as EventTarget),
+    ).toBe(false);
+    expect(orbShortcutSurfaceOwnsFocus(body as unknown as EventTarget)).toBe(true);
+    expect(
+      orbShortcutSurfaceOwnsFocus(
+        new FakeElement(false, true) as unknown as EventTarget,
+      ),
+    ).toBe(true);
+    expect(
+      orbShortcutSurfaceOwnsFocus(
+        new FakeElement(false, false) as unknown as EventTarget,
+      ),
+    ).toBe(false);
   });
 });

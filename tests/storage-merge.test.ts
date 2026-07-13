@@ -5,6 +5,7 @@ import {
   MAX_REPLICA_EVENTS,
   appendLocalEvent,
   appendLocalEventWithGroupUpdate,
+  canonicalGroupDigest,
   deleteReplicaDatabase,
   eventRoot,
   getCircle,
@@ -231,6 +232,103 @@ describe("local-first replica merge", () => {
     ).rejects.toThrow(/member identity conflicts/iu);
   });
 
+  it("rejects a stale structural update after a concurrent roster/status/chapter change", async () => {
+    const fern = await identity("Fern");
+    const morrow = await identity("Morrow", 1);
+    const group = await groupFor([fern, morrow]);
+    const db = await database("stale-structural-group");
+    await saveCircle(db, group);
+    const expected = {
+      eventRoot: await eventRoot([]),
+      groupDigest: canonicalGroupDigest(group),
+    };
+    const newerGroup = clone(group);
+    newerGroup.members[morrow.memberId]!.active = false;
+    newerGroup.status = "heirloom-ready";
+    newerGroup.chapter = 3;
+
+    const groupMutation = saveCircle(db, newerGroup);
+    const staleUpdate = appendLocalEventWithGroupUpdate(
+      db,
+      group.id,
+      fern,
+      "reunion.seal",
+      { chapter: 1 },
+      { ...group, chapter: 1 },
+      expected,
+    );
+    const staleRejection = expect(staleUpdate).rejects.toThrow(
+      /state changed before atomic structural update/u,
+    );
+
+    await groupMutation;
+    await staleRejection;
+    expect(await getCircle(db, group.id)).toEqual(newerGroup);
+    expect(await getCircleEvents(db, group.id)).toEqual([]);
+    expect(await db.getAllFromIndex("outbox", "by-group", group.id)).toEqual([]);
+  });
+
+  it("rejects a stale event root without forking and permits a freshly bound update", async () => {
+    const fern = await identity("Fern");
+    const morrow = await identity("Morrow", 1);
+    const group = await groupFor([fern, morrow]);
+    const db = await database("stale-structural-events");
+    await saveCircle(db, group);
+    const staleBinding = {
+      eventRoot: await eventRoot([]),
+      groupDigest: canonicalGroupDigest(group),
+    };
+
+    const eventMutation = appendLocalEvent(
+      db,
+      group.id,
+      fern,
+      "story.note",
+      { text: "newer event" },
+    );
+    const staleUpdate = appendLocalEventWithGroupUpdate(
+      db,
+      group.id,
+      fern,
+      "reunion.seal",
+      { chapter: 1 },
+      { ...group, chapter: 1 },
+      staleBinding,
+    );
+    const staleRejection = expect(staleUpdate).rejects.toThrow(
+      /state changed before atomic structural update/u,
+    );
+
+    const newerEvent = await eventMutation;
+    await staleRejection;
+    expect(await getCircle(db, group.id)).toEqual(group);
+    expect(await getCircleEvents(db, group.id)).toEqual([newerEvent]);
+    expect(await db.getAllFromIndex("outbox", "by-group", group.id)).toHaveLength(1);
+
+    const currentGroup = await getCircle(db, group.id);
+    const currentEvents = await getCircleEvents(db, group.id);
+    if (!currentGroup) throw new Error("Circle missing");
+    const validEvent = await appendLocalEventWithGroupUpdate(
+      db,
+      group.id,
+      fern,
+      "reunion.seal",
+      { chapter: 1 },
+      { ...currentGroup, chapter: 1 },
+      {
+        eventRoot: await eventRoot(currentEvents),
+        groupDigest: canonicalGroupDigest(currentGroup),
+      },
+    );
+
+    expect(validEvent.body).toMatchObject({ seq: 2, prev: newerEvent.id });
+    expect(await getCircle(db, group.id)).toEqual({ ...group, chapter: 1 });
+    const finalEvents = await getCircleEvents(db, group.id);
+    expect(finalEvents.map((event) => event.body.seq).sort()).toEqual([1, 2]);
+    expect(new Set(finalEvents.map((event) => event.id)).size).toBe(2);
+    expect(await db.getAllFromIndex("outbox", "by-group", group.id)).toHaveLength(2);
+  });
+
   it("enforces the 256-event boundary before an atomic local append", async () => {
     const fern = await identity("Fern");
     const morrow = await identity("Morrow", 1);
@@ -252,6 +350,10 @@ describe("local-first replica merge", () => {
         "story.note",
         { text: "still too many" },
         { ...group, name: "Must Not Commit" },
+        {
+          eventRoot: await eventRoot(await getCircleEvents(db, group.id)),
+          groupDigest: canonicalGroupDigest(group),
+        },
       ),
     ).rejects.toThrow(/256 events/u);
     expect(await getCircleEvents(db, group.id)).toHaveLength(MAX_REPLICA_EVENTS);

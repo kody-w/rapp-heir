@@ -21,13 +21,29 @@ device authorization connects Copilot but does not create a Rapp Heir account.
 
 Rapp Heir does not request contacts or exact GPS. It does not capture, store, or synchronize raw audio. Speech
 recognition begins only on the visible push-to-talk control; where supported, the app requests local recognition.
-Browser/platform speech services may have their own behavior and policy, so typed/tap controls always provide parity.
+Browser/platform SpeechRecognition and SpeechSynthesis may use platform, browser, or vendor services (including
+network services) under their own policies, so typed/tap controls always provide parity.
 Offline deterministic quest templates require no language model or network.
 
 The optional camera highlight assist is explicit, requests **video only**, and uses `FaceDetector` locally. It stores,
 logs, networks, AI-sends, and exports no pixels, face vectors, direction history, or raw camera output. It stops all
 tracks on disable, route exit, scanner start, blur, hidden state, or page hide. If FaceDetector is unavailable, no
 whole-frame motion fallback runs.
+
+## Verified local Python exception
+
+On explicit use, the opaque sandboxed agent cell downloads Pyodide 0.26.4 from pinned jsDelivr paths and the exact
+agent manifest/source bytes from commit `dd583a19c86414f98ae6c2c6d482f409c55679a4` on
+`raw.githubusercontent.com`. The service worker does not intercept or cache either origin. Ordinary network metadata
+is subject to those providers’ policies, and browser HTTP cache retention is neither controlled nor promised by
+Rapp Heir.
+
+The host passes only bounded coarse quest inputs (context/weather, active count, companion temperament labels, and an
+empty history summary) over a private MessagePort. It passes no IDs, names, peer contribution text, raw location,
+audio, storage, credentials, keys, signing function, PeerJS object, Copilot token, DOM, or arbitrary source/URL.
+Only full-hash-verified built-in source runs. Exact bounded output is shown as inert data and cannot mutate IndexedDB
+until a user separately stages, reviews, and signs a typed proposal. If the network/runtime is unavailable, the
+existing deterministic JavaScript fallback stays local.
 
 ## Optional remote intelligence exception
 
@@ -44,10 +60,10 @@ count; and generic Circle status/chapter/counts. It excludes Circle/member IDs, 
 roots, timestamps, roster/order, invite/PIN/PeerJS/Kited fields, private keys, audio, location, memories, full history,
 unselected offerings, peer text, and heirloom/replica bytes.
 
-Copilot is instructed to return one `|||VOICE|||` separator between a bounded display answer and a short plain spoken
+Copilot is instructed to return exactly one `|||VOICE|||` separator between a bounded display answer and a short plain spoken
 version. Partial separators and the voice tail are withheld from the streaming display. Only the display answer may
 be kept in memory chat history or explicitly staged for review; only the spoken version is passed to speech
-synthesis and shown in an optional details caption. Missing/malformed separation produces an honest unavailable
+synthesis and shown in an optional details caption. Missing, malformed, multiple, or raw SSE/JSON separation produces an honest unavailable
 caption and no speech. The voice tail is not stored, signed, synchronized over PeerJS, or exported in replica packs
 or heirlooms. Stop, route exit, and logout abort pending remote work and cancel speech.
 
