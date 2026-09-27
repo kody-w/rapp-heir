@@ -1,5 +1,9 @@
 # Rapp Heir
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rapp-heir.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rapp-heir.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 Rapp Heir is a standalone, local-first mobile PWA in which nearby people found a Circle, then continue an asynchronous
 Braid of short quests. Each device keeps one persistent companion and a full signed Circle replica. On
 `#/play/:circleId`, the Circle organism becomes an **Adaptive Orb** Pocket Quest Master: Orbit presents contextual
